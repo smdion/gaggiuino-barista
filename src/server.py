@@ -87,12 +87,32 @@ def send_notification(summary: dict, analysis: dict):
         lines.append("\n\U0001f916 AI analysis unavailable")
 
     url = f"{HA_BASE}/services/{HA_NOTIFY_SERVICE.replace('.', '/')}"
+
+    # Resolve graph URL — try Supervisor API first, fall back to env, then relative path
+    graph_path = "/local/gaggiuino-barista/last_shot.png"
+    ha_base_url = os.getenv("HA_BASE_URL", "").rstrip("/")
+    if not ha_base_url:
+        try:
+            cfg = requests.get(
+                "http://supervisor/core/api/config",
+                headers={"Authorization": f"Bearer {HA_TOKEN}",
+                         "Content-Type": "application/json"},
+                timeout=5,
+            ).json()
+            ha_base_url = (cfg.get("external_url") or cfg.get("internal_url") or "").rstrip("/")
+        except Exception as e:
+            log(f"WARNING: Could not fetch HA base URL from Supervisor: {e}")
+
+    graph_url = f"{ha_base_url}{graph_path}" if ha_base_url else graph_path
+
     payload = {
         # "title": "\u2615 Espresso Shot Done",
         "title": title,
         "message": "\n".join(lines),
         "data": {
-            "image": "/local/gaggiuino-barista/last_shot.png",
+            # "image": "/local/gaggiuino-barista/last_shot.png",
+            "image": graph_path,
+            "url": graph_url,
             "push": {"sound": "default"},
         },
     }
