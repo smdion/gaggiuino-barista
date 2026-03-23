@@ -1,7 +1,7 @@
 name: Gaggiuino Barista
 slug: gaggiuino_barista
 version: "1.1.0"
-description: Espresso shot graphs with deterministic + AI analysis for Gaggiuino
+description: Automatically detects shots, generates detailed graphs, runs a deterministic telemetry analyzer plus AI phrasing, and sends mobile push notifications with annotated graphs and next-shot tuning recommendations.
 url: https://github.com/nikosiaf/gaggiuino-barista
 arch:
   - amd64
