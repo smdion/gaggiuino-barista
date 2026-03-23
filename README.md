@@ -68,6 +68,6 @@ This keeps the extraction logic stable while still giving readable annotations.
 
 ## Credits
 
-- [Gaggiuino](https://github.com/Zer0-bit/gaggiuino) - Open source espresso machine controller.
+- [Gaggiuino](https://github.com/Zer0-bit/gaggiuino) - Gaggiuino is a community-driven project to add high-end features to Gaggia Classic espresso machines. Implementing the Gaggiuino mod improves performance and precision with temp control, profiling, profile sharing, and other features.
 - [Home Assistant](https://www.home-assistant.io/) - Open source home automation that puts local control and privacy first.
 - [Config Template Card Card](https://github.com/iantrich/config-template-card) - This card is for Lovelace on Home Assistant that allows you to use pretty much any valid Javascript on the hass object in your configuration.
