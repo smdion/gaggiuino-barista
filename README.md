@@ -3,7 +3,7 @@
 </p>
 
 # Gaggiuino Barista 
-# Home Assistant Add-on for Gaggiuino modified espresso machines.
+# [Home Assistant](https://www.home-assistant.io/) add-on for [Gaggiuino](https://github.com/Zer0-bit/gaggiuino) espresso machines.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/nikosiaf/gaggiuino-barista/blob/main/LICENSE)
 
