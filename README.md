@@ -1,5 +1,5 @@
 <p>
-  <img src="https://raw.githubusercontent.com/nikosiaf/gaggiuino-barista/main/logo.png" alt="Gaggiuino Barista Logo" width="220">
+  <img src="https://raw.githubusercontent.com/nikosiaf/gaggiuino-barista/main/logo.png" alt="Gaggiuino Barista Logo" width="320">
 </p>
 
 # Gaggiuino Barista 

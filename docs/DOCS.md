@@ -181,7 +181,7 @@ After rebuilding:
 
 ### Optional Step B — Copy the history script
 
-Copy `gaggiuino_barista_history.py` to your HA config scripts folder:
+Copy `addon/gaggiuino_barista_history.py` to your HA config scripts folder:
 
 ```yaml
 /config/scripts/gaggiuino_barista_history.py
