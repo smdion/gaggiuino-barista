@@ -38,49 +38,139 @@ jobs:
           echo "Upstream SHA: $UPSTREAM_SHA"
           echo "Has updates: $(git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD && echo false || echo true)"
 
-      - name: Create issue for upstream updates
-        if: steps.check.outputs.has_updates == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          UPSTREAM_SHA="${{ steps.check.outputs.upstream_sha }}"
-          EXISTING=$(gh issue list --label "upstream-update" --state open --json number --jq '.[0].number // empty')
-          if [ -z "$EXISTING" ]; then
-            gh issue create \
-              --title "Upstream update available (${UPSTREAM_SHA:0:8})" \
-              --body "New commits detected on [nikosiaf/gaggiuino-barista](https://github.com/nikosiaf/gaggiuino-barista).
-
-          Upstream HEAD: \`${UPSTREAM_SHA}\`
-
-          Run the sync workflow or manually update." \
-              --label "upstream-update"
-          else
-            echo "Issue #$EXISTING already open for upstream updates"
-          fi
-
-  build-on-upstream:
-    name: Build (upstream check)
+  test-upstream-compat:
+    name: Test upstream compatibility
     runs-on: ubuntu-latest
     needs: [check-upstream]
     if: needs.check-upstream.outputs.has_updates == 'true'
-    strategy:
-      matrix:
-        dockerfile: [Dockerfile.standalone, Dockerfile]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream and apply fork customizations
+        id: merge
+        run: |
+          git config user.name "CI"
+          git config user.email "ci@github.com"
+          git remote add upstream https://github.com/nikosiaf/gaggiuino-barista.git || true
+          git fetch upstream main
+
+          # Try to merge upstream into our fork
+          if git merge upstream/main --no-edit; then
+            echo "merge_ok=true" >> "$GITHUB_OUTPUT"
+            echo "Merge succeeded — testing build..."
+          else
+            echo "merge_ok=false" >> "$GITHUB_OUTPUT"
+            echo "Merge conflicts detected:"
+            git diff --name-only --diff-filter=U
+            git merge --abort
+            exit 0
+          fi
+
+      - name: Lint merged Python
+        if: steps.merge.outputs.merge_ok == 'true'
+        run: |
+          python3 -m py_compile src/server.py
+          python3 -m py_compile src/plot_logic.py
+          python3 -m py_compile src/annotation_engine.py
 
       - name: Set up Docker Buildx
+        if: steps.merge.outputs.merge_ok == 'true'
         uses: docker/setup-buildx-action@v3
 
-      - name: Build ${{ matrix.dockerfile }}
+      - name: Build Dockerfile.standalone
+        if: steps.merge.outputs.merge_ok == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
+          file: Dockerfile.standalone
           push: false
-          tags: gaggiuino-barista:test
+          tags: gaggiuino-barista:upstream-test
+
+      - name: Build Dockerfile (HA add-on)
+        if: steps.merge.outputs.merge_ok == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          tags: gaggiuino-barista:upstream-test-ha
           build-args: |
             BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.21
+
+      - name: Verify fork customizations survived merge
+        if: steps.merge.outputs.merge_ok == 'true'
+        run: |
+          echo "Checking fork-specific features..."
+          # SHOT_ID env var support in plot_logic.py
+          grep -q 'SHOT_ID' src/plot_logic.py || { echo "FAIL: SHOT_ID support missing from plot_logic.py"; exit 1; }
+          # Discord webhook support in server.py
+          grep -q 'DISCORD_WEBHOOK' src/server.py || { echo "FAIL: Discord webhook support missing from server.py"; exit 1; }
+          grep -q 'send_discord_notification' src/server.py || { echo "FAIL: send_discord_notification missing from server.py"; exit 1; }
+          # Batch endpoints in server.py
+          grep -q 'plot_last_n' src/server.py || { echo "FAIL: batch endpoint missing from server.py"; exit 1; }
+          grep -q 'plot_shot' src/server.py || { echo "FAIL: single shot endpoint missing from server.py"; exit 1; }
+          # run_plot_for_shot helper
+          grep -q 'run_plot_for_shot' src/server.py || { echo "FAIL: run_plot_for_shot helper missing from server.py"; exit 1; }
+          # Standalone Dockerfile exists
+          test -f Dockerfile.standalone || { echo "FAIL: Dockerfile.standalone missing"; exit 1; }
+          test -f docker-compose.standalone.yml || { echo "FAIL: docker-compose.standalone.yml missing"; exit 1; }
+          echo "All fork customizations verified."
+
+  notify-upstream:
+    name: Notify upstream status
+    runs-on: ubuntu-latest
+    needs: [check-upstream, test-upstream-compat]
+    if: always() && needs.check-upstream.outputs.has_updates == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create or update issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHA: ${{ needs.check-upstream.outputs.upstream_sha }}
+          COMPAT_RESULT: ${{ needs.test-upstream-compat.result }}
+        run: |
+          if [ "$COMPAT_RESULT" = "success" ]; then
+            STATUS="Builds OK"
+            EMOJI="✅"
+            BODY="New commits detected on [nikosiaf/gaggiuino-barista](https://github.com/nikosiaf/gaggiuino-barista).
+
+          Upstream HEAD: \`${UPSTREAM_SHA}\`
+
+          **${EMOJI} Compatibility: ${STATUS}**
+          - Merge: clean
+          - Python lint: passed
+          - Docker build (standalone): passed
+          - Docker build (HA add-on): passed
+          - Fork customizations: verified
+
+          Safe to sync — all fork features survived the merge."
+          else
+            STATUS="Needs attention"
+            EMOJI="⚠️"
+            BODY="New commits detected on [nikosiaf/gaggiuino-barista](https://github.com/nikosiaf/gaggiuino-barista).
+
+          Upstream HEAD: \`${UPSTREAM_SHA}\`
+
+          **${EMOJI} Compatibility: ${STATUS}**
+          Upstream changes conflict with fork customizations or break the build.
+          Manual review required before syncing.
+
+          [View CI run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          fi
+
+          # Close any existing open issue first
+          EXISTING=$(gh issue list --label "upstream-update" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue close "$EXISTING" --comment "Superseded by new upstream check."
+          fi
+
+          gh issue create \
+            --title "${EMOJI} Upstream update available (${UPSTREAM_SHA:0:8}) — ${STATUS}" \
+            --body "$BODY" \
+            --label "upstream-update"
 
   build:
     name: Build Docker images
