@@ -1,0 +1,22 @@
+FROM alpine:3.21
+
+RUN apk add --no-cache \
+    python3 \
+    py3-pip \
+    py3-matplotlib \
+    py3-requests \
+    py3-flask \
+    && pip3 install --break-system-packages waitress
+
+RUN mkdir -p /app/src /app/profiles
+
+WORKDIR /app
+
+COPY src/server.py /app/src/
+COPY src/plot_logic.py /app/src/
+COPY src/annotation_engine.py /app/src/
+COPY profiles/ /app/profiles/
+
+EXPOSE 5000
+
+CMD ["python3", "/app/src/server.py"]

@@ -1,0 +1,18 @@
+version: "3.8"
+services:
+  gaggiuino-barista:
+    build:
+      context: .
+      dockerfile: Dockerfile.standalone
+    container_name: gaggiuino-barista
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - API_BASE=http://gaggiuino.local
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL:-}
+      - LLM_LANGUAGE=${LLM_LANGUAGE:-en}
+    volumes:
+      - ./data:/homeassistant/www/gaggiuino-barista

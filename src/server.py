@@ -31,6 +31,8 @@ import json
 import threading
 import subprocess
 from datetime import datetime
+import pathlib
+from pathlib import Path
 from flask import Flask, jsonify
 import requests
 
@@ -57,6 +59,9 @@ TIMEOUT         = 5          # HTTP request timeout when talking to Gaggiuino
 HA_TOKEN          = os.getenv("SUPERVISOR_TOKEN", "")
 HA_BASE           = "http://supervisor/core/api"
 HA_NOTIFY_SERVICE = os.getenv("HA_NOTIFY_SERVICE", "notify.mobile_app_your_phone")
+
+# Discord webhook (standalone mode - independent of HA)
+DISCORD_WEBHOOK   = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 # Language configuration for AI analysis
 LLM_LANGUAGE  = os.getenv("LLM_LANGUAGE", "en")
@@ -92,36 +97,22 @@ def log(msg: str):
 # =========================
 def send_notification(summary: dict, analysis: dict):
     """
-    Send mobile push notification via Home Assistant Companion app.
-    
+    Send notifications via HA mobile push and/or Discord webhook.
+
     Args:
         summary: Shot metadata dict (duration, weight, pressure, temp, profile)
         analysis: AI analysis dict (score, verdict, tuning, notification_text)
-    
-    The notification includes:
-    - Title with shot score (e.g., "☕ Shot Score: 82/100 ☕")
-    - Shot parameters (temp, pressure, weight, duration)
-    - First tuning tip from AI analysis
-    - Inline graph image
-    
-    Note: Called from server.py where SUPERVISOR_TOKEN is valid.
-          plot_logic.py cannot send notifications directly (token not inherited).
     """
-    # Check if we have a valid HA token
-    if not HA_TOKEN:
-        log("WARNING: SUPERVISOR_TOKEN not set - skipping notification")
-        return
-
     # Extract shot parameters
     duration = summary.get("duration_s", "")
     weight   = summary.get("final_weight_g", "")
     target_w = summary.get("target_weight_g", "")
     pressure = summary.get("max_pressure_bar", "")
     temp     = summary.get("water_temp_c", "")
-    
+
     # Build notification title (includes shot score if available)
     title = "\u2615 Espresso Shot Done \u2615"
-    
+
     # Format yield string (e.g., "36g/38g" or just "36g" if no target)
     yield_str = f"{weight}g/{target_w}g" if target_w and target_w != "-" else f"{weight}g"
 
@@ -129,74 +120,90 @@ def send_notification(summary: dict, analysis: dict):
     lines = [
         f"\U0001f321{temp}\u00b0C \U0001f4c8{pressure}bar \u2696{yield_str} \u23f1{duration}s",
     ]
-    
+
     # Add AI analysis results if available
     if analysis:
         tuning = analysis.get("tuning", [])
         shot_score = analysis.get("score")
-        
+
         # Include score in title if available
         if shot_score:
             try:
                 title = f"\u2615 Shot Score: {int(round(float(shot_score)))}/100 \u2615\n"
             except Exception:
                 title = "Espresso Shot Done !"
-        
+
         # Include first tuning tip
         if tuning:
             lines.append(f"\n\U0001f527 {tuning[0]}")
     else:
         lines.append("\n\U0001f916 AI analysis unavailable")
 
-    # Build notification payload for HA API
-    notify_url = f"{HA_BASE}/services/{HA_NOTIFY_SERVICE.replace('.', '/')}"
-    
-    # Resolve the graph URL - try Supervisor API first, fall back to relative path
-    # The relative path works when accessed from within HA network
-    graph_path = "/local/gaggiuino-barista/last_shot.png"
-    ha_base_url = os.getenv("HA_BASE_URL", "").rstrip("/")
-    
-    # Try to get HA base URL from Supervisor config
-    if not ha_base_url:
-        try:
-            cfg = requests.get(
-                "http://supervisor/core/api/config",
-                headers={"Authorization": f"Bearer {HA_TOKEN}"},
-                timeout=5,
-            ).json()
-            # Use external_url (public) or internal_url (local) as base
-            ha_base_url = (cfg.get("external_url") or cfg.get("internal_url") or "").rstrip("/")
-        except Exception as e:
-            log(f"WARNING: Could not fetch HA base URL from Supervisor: {e}")
+    # HA mobile notification (requires SUPERVISOR_TOKEN)
+    if HA_TOKEN:
+        notify_url = f"{HA_BASE}/services/{HA_NOTIFY_SERVICE.replace('.', '/')}"
+        graph_path = "/local/gaggiuino-barista/last_shot.png"
+        ha_base_url = os.getenv("HA_BASE_URL", "").rstrip("/")
 
-    # Build full graph URL if we have a base, otherwise use relative path
-    graph_url = f"{ha_base_url}{graph_path}" if ha_base_url else graph_path
+        if not ha_base_url:
+            try:
+                cfg = requests.get(
+                    "http://supervisor/core/api/config",
+                    headers={"Authorization": f"Bearer {HA_TOKEN}"},
+                    timeout=5,
+                ).json()
+                ha_base_url = (cfg.get("external_url") or cfg.get("internal_url") or "").rstrip("/")
+            except Exception as e:
+                log(f"WARNING: Could not fetch HA base URL from Supervisor: {e}")
 
-    # Construct the notification payload
-    payload = {
-        "title": title,
-        "message": "\n".join(lines),
-        "data": {
-            "image": graph_path,      # Relative path for HA Companion app
-            "url": graph_url,         # Full URL for tapping notification
-            "push": {"sound": "default"},
-        },
-    }
-    
-    # Send the notification via HA API
-    try:
-        response = requests.post(
-            notify_url,
-            headers={
-                "Authorization": f"Bearer {HA_TOKEN}",
-                "Content-Type": "application/json",
+        graph_url = f"{ha_base_url}{graph_path}" if ha_base_url else graph_path
+        payload = {
+            "title": title,
+            "message": "\n".join(lines),
+            "data": {
+                "image": graph_path,
+                "url": graph_url,
+                "push": {"sound": "default"},
             },
-            json=payload,
-            timeout=10,
-        )
-        log(f"Notification response: HTTP {response.status_code} - {response.text[:100]}")
+        }
+
+        try:
+            response = requests.post(
+                notify_url,
+                headers={
+                    "Authorization": f"Bearer {HA_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=10,
+            )
+            log(f"Notification response: HTTP {response.status_code} - {response.text[:100]}")
+        except Exception as e:
+            log(f"WARNING: HA notification failed: {e}")
+
+    # Discord notification (standalone mode - independent of HA)
+    if DISCORD_WEBHOOK:
+        send_discord_notification(title, "\n".join(lines))
+
+
+def send_discord_notification(title: str, message: str):
+    """Send a Discord webhook notification with the shot graph attached."""
+    graph_file = Path("/homeassistant/www/gaggiuino-barista/last_shot.png")
+    payload = {"content": f"**{title}**\n{message}"}
+    try:
+        if graph_file.exists():
+            with open(graph_file, "rb") as f:
+                r = requests.post(
+                    DISCORD_WEBHOOK,
+                    data={"payload_json": json.dumps(payload)},
+                    files={"file": ("last_shot.png", f, "image/png")},
+                    timeout=15,
+                )
+        else:
+            r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=15)
+        log(f"Discord notification: HTTP {r.status_code}")
     except Exception as e:
-        log(f"WARNING: Notification failed: {e}")
+        log(f"WARNING: Discord notification failed: {e}")
 
 
 # =========================
@@ -473,45 +480,24 @@ def _wait_for_new_shot_id(timeout: int = 30) -> int | None:
 # =========================
 # FLASK WEB ROUTES
 # =========================
-@app.route("/plot/latest", methods=["POST", "GET"])
-def plot_latest():
-    """
-    Manual trigger endpoint for plotting the latest shot.
-    
-    POST/GET /plot/latest
-    
-    Use cases:
-    - Manual trigger from Home Assistant dashboard button
-    - Re-generate plot for a specific shot
-    - Test the add-on without pulling a new shot
-    
-    Returns:
-        JSON with ok=True and stdout on success, or error details on failure.
-    """
-    machine = get_machine_status()
-    if machine is None:
-        return jsonify({"ok": False, "error": "Gaggiuino unreachable - machine may be offline"}), 503
-    
-    shot_id = get_latest_shot_id()
-    log(f"Manual plot triggered | shot_id={shot_id} profile={machine['profile']}")
-    
+def run_plot_for_shot(shot_id: int = None):
+    """Run plot_logic.py for a specific shot ID (or latest if None).
+    Returns (summary, analysis, error_response) - error_response is None on success."""
+    env = os.environ.copy()
+    if shot_id is not None:
+        env["SHOT_ID"] = str(shot_id)
+
     try:
-        env = os.environ.copy()
-        log(f"LLM_LANGUAGE env = {LANGUAGES.get(env.get('LLM_LANGUAGE', ''), env.get('LLM_LANGUAGE', 'NOT SET'))}")
-        
         result = subprocess.run(
             ["python", "/app/src/plot_logic.py"],
-            capture_output=True, text=True, timeout=300,
-            env=env,
+            capture_output=True, text=True, timeout=300, env=env,
         )
-        
         if result.returncode != 0:
-            log("Manual plot FAILED:")
+            log(f"Plot FAILED for shot #{shot_id}:")
             for line in result.stderr.strip().splitlines():
                 log(f"  {line}")
-            return jsonify({"ok": False, "stderr": result.stderr}), 500
+            return {}, {}, (jsonify({"ok": False, "stderr": result.stderr}), 500)
 
-        # Parse output and send notification
         summary = {}
         analysis = {}
         for line in result.stdout.strip().splitlines():
@@ -519,9 +505,9 @@ def plot_latest():
                 try:
                     summary = json.loads(line[8:])
                     analysis = {
-                        "verdict": summary.get("verdict", ""),
-                        "tuning": summary.get("tuning", []),
-                        "score": summary.get("score", 0),
+                        "verdict":           summary.get("verdict", ""),
+                        "tuning":            summary.get("tuning", []),
+                        "score":             summary.get("score", 0),
                         "notification_text": summary.get("notification_text", ""),
                     }
                     log(f"  [AI] Shot #{summary.get('shot_id')} | {summary.get('profile')} | verdict: {bool(summary.get('verdict'))}")
@@ -532,16 +518,64 @@ def plot_latest():
             else:
                 log(f"  -> {line}")
 
-        log("Manual plot completed.")
-        send_notification(summary, analysis)
-        return jsonify({"ok": True, "stdout": result.stdout})
-        
+        return summary, analysis, None
     except subprocess.TimeoutExpired:
-        log("Manual plot TIMED OUT after 300s")
-        return jsonify({"ok": False, "error": "Plot timed out"}), 500
-        
+        log(f"Plot TIMED OUT for shot #{shot_id}")
+        return {}, {}, (jsonify({"ok": False, "error": "Plot timed out"}), 500)
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return {}, {}, (jsonify({"ok": False, "error": str(e)}), 500)
+
+
+@app.route("/plot/latest", methods=["POST", "GET"])
+def plot_latest():
+    """Manual trigger endpoint for plotting the latest shot."""
+    machine = get_machine_status()
+    if machine is None:
+        return jsonify({"ok": False, "error": "Gaggiuino unreachable - machine may be offline"}), 503
+
+    shot_id = get_latest_shot_id()
+    log(f"Manual plot triggered | shot_id={shot_id} profile={machine['profile']}")
+    summary, analysis, error = run_plot_for_shot()
+    if error:
+        return error
+    log("Manual plot completed.")
+    send_notification(summary, analysis)
+    return jsonify({"ok": True, "shot_id": shot_id})
+
+
+@app.route("/plot/<int:shot_id>", methods=["POST", "GET"])
+def plot_shot(shot_id):
+    """Analyze a specific shot by ID."""
+    log(f"Plot triggered for shot #{shot_id}")
+    summary, analysis, error = run_plot_for_shot(shot_id)
+    if error:
+        return error
+    log(f"Plot completed for shot #{shot_id}")
+    send_notification(summary, analysis)
+    return jsonify({"ok": True, "shot_id": shot_id})
+
+
+@app.route("/plot/last/<int:count>", methods=["POST", "GET"])
+def plot_last_n(count):
+    """Batch analyze the last N shots."""
+    if count < 1 or count > 50:
+        return jsonify({"ok": False, "error": "count must be between 1 and 50"}), 400
+    latest_id = get_latest_shot_id()
+    if latest_id is None:
+        return jsonify({"ok": False, "error": "Could not determine latest shot ID"}), 503
+    log(f"Batch plot triggered | last {count} shots (IDs {latest_id - count + 1} to {latest_id})")
+    results = []
+    for sid in range(latest_id - count + 1, latest_id + 1):
+        log(f"Processing shot #{sid} ({sid - (latest_id - count)}/{count})...")
+        summary, analysis, error = run_plot_for_shot(sid)
+        if error:
+            log(f"Shot #{sid} failed, skipping")
+            results.append({"shot_id": sid, "ok": False})
+            continue
+        send_notification(summary, analysis)
+        results.append({"shot_id": sid, "ok": True, "score": summary.get("score")})
+    log(f"Batch plot completed: {sum(1 for r in results if r['ok'])}/{count} succeeded")
+    return jsonify({"ok": True, "results": results})
 
 
 @app.route("/status", methods=["GET"])
@@ -577,7 +611,6 @@ def status():
 # =========================
 # STARTUP SEQUENCE
 # =========================
-import pathlib
 import sys
 
 # Ensure output directory exists
