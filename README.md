@@ -103,14 +103,13 @@ Shot Data → Deterministic Analysis → LLM Phrasing → Graph + Notification
 
 ## 📦 Credits
 
-- [Gaggiuino](https://github.com/Zer0-bit/gaggiuino) - Community espresso profiles
+- [Gaggiuino](https://github.com/Zer0-bit/gaggiuino) - Community-driven project to add high-end features to Gaggia Classic espresso machines.
 - [Home Assistant](https://www.home-assistant.io/) - Home automation platform
-- [Community Profiles](https://github.com/Zer0-bit/gaggiuino/tree/community/profiles) - CC BY-NC 4.0
+- [Community Profiles](https://github.com/Zer0-bit/gaggiuino/tree/community/profiles) - Community espresso profiles
 
 ---
 
 <p align="center">
   <a href="https://github.com/nikosiaf/gaggiuino-barista/issues">🐛 Issues</a> •
-  <a href="https://github.com/nikosiaf/gaggiuino-barista/discussions">💬 Discussions</a> •
   <a href="https://github.com/nikosiaf/gaggiuino-barista/tree/main/docs">📖 Full Docs</a>
 </p>
