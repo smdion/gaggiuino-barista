@@ -1,5 +1,48 @@
 # Changelog
 
+## 2.0.0
+
+### Added
+- **Language Selection**: New `llm_language` config option for AI phrasing (en, el, it, de, es, fr)
+- **Profile-Aware Analysis**: Complete rewrite of annotation engine with profile-specific thresholds for lever, flow control, pressure, and filter profiles
+- **Pre-infusion Analysis**: New `extract_preinfusion_phases()` detects wetting, soaking, compression phases with uniformity scoring
+- **Flow Ratio Tracking**: New `extract_flow_ratio_metrics()` computes weight_flow/pump_flow ratio to detect channeling and restriction
+- **Taste-Based Scoring**: New `taste_based_scoring()` produces taste profile (well_extracted/mostly_balanced/slightly_off/unbalanced/poorly_extracted)
+- **Profile Matching**: Automatically matches shot profile against 41 bundled community profiles
+  - Exact/fuzzy name matching
+  - Phase structure matching when name doesn't match
+- **Profile Adherence Scoring**: Scores how well shot followed matched profile expectations
+- **Local Profiles Support**: Reads custom profiles from `/homeassistant/www/gaggiuino-barista/profiles/`
+- **New Events**: slow_preinfusion, fast_preinfusion, uneven_preinfusion, possible_channeling, poor_profile_adherence
+
+### Changed
+- **Scoring Recalibrated**: Deterministic scoring now aligns with human evaluation
+  - Target hit gives +10 bonus (was +5)
+  - Stability thresholds raised - only extreme deviations penalized
+  - Pre-infusion uniformity tolerance increased
+  - Flow ratio thresholds relaxed
+  - "well_extracted" threshold lowered (net >= 1, was >= 2)
+  - Severity penalties reduced (2 per warning, was 3)
+- **Score Thresholds Updated**: 80+ (very good), 70-79 (good with flaws), 60-69 (drinkable but off), <60 (problematic)
+- **Score Stamp Changed**: "SHOT X/100" to "SCORE X/100"
+- **LLM Prompt Enhanced**: Now includes profile context, extraction profile, and flow ratio for better phrasing
+- **Fallback Analysis Improved**: Uses new extraction_profile for profile-specific tuning recommendations
+- **New Output Fields**: profile_match_type, profile_match_confidence, matched_profile_name, profile_adherence_score, taste_profile, extraction_profile
+
+### Fixed
+- Empty taste_profile and extraction_profile fields in output
+- Profile adherence scoring now checks real metrics (pressure/flow stability, flow ratio)
+- Score and heuristic fields properly passed through to JSON output
+
+### Technical
+- 41 Gaggiuino community profiles bundled in Docker image at `/app/profiles/`
+- Profiles directory added to Dockerfile COPY command
+- Dynamic token limits: 700 tokens for English, 1500 tokens for other languages (UTF-8 multi-byte encoding requires more tokens)
+- Environment variable `LLM_LANGUAGE` properly propagated to subprocess via `env=os.environ.copy()`
+- Detailed code comments added to all source files (server.py, plot_logic.py, annotation_engine.py)
+
+---
+
 ## 1.1.0
 
 ### Added
@@ -14,6 +57,8 @@
 - README and documentation now describe Anthropic primary + Gemini fallback correctly
 - AI annotations are now grounded to detected event times instead of free-form timestamps
 - Add-on description updated for deterministic + AI architecture
+
+---
 
 ## 1.0.4
 
@@ -80,7 +125,7 @@
 - Includes profile, duration, yield, peak pressure, temperature, AI analysis
 - Includes graph image inline
 - JSON shot data written to `/homeassistant/www/gaggiuino-barista/last_shot.json`
-- Rolling shot history in `shot_history.json` (last 5 shots)
+- Rolling shot history in `shot_history.json` (last 10 shots)
 - Rolling PNG history (last 30 graphs) with automatic cleanup
 - Manual trigger via HTTP `GET/POST /plot/latest` — triggers plot + notification
 - Health check endpoint `GET /status` — returns watcher state + live machine data

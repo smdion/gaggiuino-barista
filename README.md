@@ -1,73 +1,116 @@
-<p>
-  <img src="https://raw.githubusercontent.com/nikosiaf/gaggiuino-barista/main/logo.png" alt="Gaggiuino Barista Logo" width="320">
+<p align="center">
+  <img src="https://raw.githubusercontent.com/nikosiaf/gaggiuino-barista/main/logo.png" alt="Gaggiuino Barista Logo" width="280">
 </p>
 
-# Gaggiuino Barista [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/nikosiaf/gaggiuino-barista/blob/main/LICENSE)
+<h1 align="center">☕ Gaggiuino Barista</h1>
 
-# [Home Assistant](https://www.home-assistant.io/) add-on for [Gaggiuino](https://github.com/Zer0-bit/gaggiuino) espresso machines.
-Automatically detects shots, generates detailed graphs, runs a deterministic telemetry analyzer plus AI phrasing, and sends mobile push notifications with annotated graphs and next-shot tuning recommendations.
+<p align="center">
+  <a href="https://github.com/nikosiaf/gaggiuino-barista/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Personal%20Use-red" alt="License"></a>
+  <a href="https://www.home-assistant.io/"><img src="https://img.shields.io/badge/Home%20Assistant-Add--on-blue" alt="HA"></a>
+  <img src="https://img.shields.io/badge/Version-2.0.0-green" alt="v2.0.0">
+</p>
 
-## What's new in 1.1.0
+<p align="center">
+  <strong>AI-powered espresso shot analysis for Home Assistant</strong><br>
+  Auto-detect shots • Beautiful graphs • Smart feedback • Mobile notifications
+</p>
 
-- New **hybrid annotation engine**
-  - deterministic telemetry analyzer computes extraction features
-  - deterministic event detector finds anchored moments in the shot
-  - Anthropic rewrites those events into clean graph labels, verdict, tuning, and score
-  - Gemini fallback uses the **same JSON schema and prompt contract**
-- New AI output fields in `last_shot.json`
-  - `ai_provider`
-  - `score`
-  - `confidence`
-  - `features`
-  - `detected_events`
-- More stable AI behavior: the LLM no longer invents the shot structure from scratch
+---
 
-## Features
+## ✨ What's New in 2.0.0
 
-- Auto shot detection via brew switch + shot ID confirmation
-- Detailed shot graph: pressure, flow, temperature, weight curves with glow effects
-- Deterministic telemetry analyzer for extraction features and event detection
-- AI-powered graph annotations with timestamp anchors
-- Anthropic primary provider, Gemini fallback
-- Shot score (`0–100`), verdict, and tuning recommendations
-- Mobile push notification with graph image
-- JSON shot data written to `/local/gaggiuino-barista/last_shot.json` for HA template sensors
-- Manual trigger and health check HTTP endpoints
-- Graceful offline handling when machine is unreachable
+| Feature | Description |
+|---------|-------------|
+| 🎯 **Profile-Aware Analysis** | Matches your shots against community or custom profiles |
+| 🌍 **Multi-Language** | AI feedback in English, Greek, Italian, German, Spanish, French |
+| 📊 **Flow Ratio Tracking** | Detects channeling and restriction issues |
+| 🧠 **Taste Prediction** | Predicts extraction quality (well_extracted → poorly_extracted) |
+| ⭐ **Smarter Scoring** | Calibrated to match human evaluation |
 
-## Installation
+---
 
-1. In Home Assistant go to **Settings -> Add-ons -> Add-on Store**
-2. Click the three dots menu (top right) -> **Repositories**
-3. Add: `https://github.com/nikosiaf/gaggiuino-barista`
-4. Find **Gaggiuino Barista** in the store and install it
+## 🚀 Quick Start
 
-## Quick Setup
+```bash
+# 1. Install from HA Add-on Store → Add Repository → https://github.com/nikosiaf/gaggiuino-barista
 
-1. Add your Gaggiuino base URL and notify service
-2. Add an **Anthropic API key** for primary AI phrasing
-3. Optionally add a **Gemini API key** for fallback
-4. Add the REST sensor from `gaggiuino_barista/gaggiuino_barista_sensors.yaml` to your HA config
-5. Start or rebuild the add-on
+# 2. Configure in Add-on UI:
+   • api_base: http://gaggiuino.local
+   • anthropic_api_key: sk-ant-... (recommended, ~$0.001/shot)
+   • gemini_api_key: (optional fallback)
+   • ha_notify_service: notify.mobile_app_your_phone
+   • llm_language: en (or el, it, de, es, fr)
 
-See the [Documentation](https://github.com/nikosiaf/gaggiuino-barista/blob/main/docs/DOCS.md) for full setup instructions.
-
-## AI architecture
-
-The add-on now uses this pipeline:
-
-```text
-shot telemetry
-  -> deterministic feature extraction
-  -> deterministic event detection
-  -> LLM phrasing layer
-  -> graph overlay + JSON + mobile notification
+# 3. Add REST sensor to configuration.yaml:
+rest:
+  - resource: "http://YOUR-HA-IP:8123/local/gaggiuino-barista/last_shot.json"
+    scan_interval: 10
+    sensor:
+      - name: "Gaggiuino Last Shot"
+        unique_id: gaggiuino_barista_last_shot
+        value_template: "{{ value_json.shot_id }}"
+        json_attributes: "{{ value_json.keys() | list }}"
 ```
 
-This keeps the extraction logic stable while still giving readable annotations.
+---
 
-## Credits
+## 📱 What You Get
 
-- [Gaggiuino](https://github.com/Zer0-bit/gaggiuino) - Gaggiuino is a community-driven project to add high-end features to Gaggia Classic espresso machines. Implementing the Gaggiuino mod improves performance and precision with temp control, profiling, profile sharing, and other features.
-- [Home Assistant](https://www.home-assistant.io/) - Open source home automation that puts local control and privacy first.
-- [Config Template Card Card](https://github.com/iantrich/config-template-card) - This card is for Lovelace on Home Assistant that allows you to use pretty much any valid Javascript on the hass object in your configuration.
+```
+☕ Shot Score: 85/100 ☕
+🌡93°C 📈9.4bar ⚖48.6g ⏱33s
+
+🔧 Grind finer to slow the opening
+```
+
+**Plus:**
+- 📈 Detailed shot graphs with pressure/flow/temperature curves
+- 🏷️ AI annotations at key extraction moments
+- 🔔 Push notification to your phone
+- 📊 Shot history (last 10 shots)
+
+---
+
+## 🧠 How It Works
+
+```
+Shot Data → Deterministic Analysis → LLM Phrasing → Graph + Notification
+     ↓              ↓                    ↓              ↓
+ Gaggiuino    Feature Extraction     (Claude/Gemini)  HA Push
+ API          Event Detection        Natural Language  + Graph
+```
+
+**Analysis includes:**
+- First drops timing
+- Pre-infusion quality (wetting → soaking → compression)
+- Pressure/flow stability
+- Flow ratio (channeling detection)
+- Profile adherence scoring
+- Taste classification
+
+---
+
+## 🎯 Score Guide
+
+| Score | Rating | What it means |
+|-------|--------|---------------|
+| 80+ | ⭐ Excellent | Hit targets, stable extraction |
+| 70-79 | 👍 Good | Minor issues, still pleasant |
+| 60-69 | 😐 Drinkable | Noticeable problems |
+| <60 | ⚠️ Fix it | Significant issues detected |
+
+---
+
+## 📦 Credits
+
+- [Gaggiuino](https://github.com/Zer0-bit/gaggiuino) - Community espresso profiles
+- [Home Assistant](https://www.home-assistant.io/) - Home automation platform
+- [Community Profiles](https://github.com/Zer0-bit/gaggiuino/tree/community/profiles) - CC BY-NC 4.0
+
+---
+
+<p align="center">
+  <a href="https://github.com/nikosiaf/gaggiuino-barista/issues">🐛 Issues</a> •
+  <a href="https://github.com/nikosiaf/gaggiuino-barista/discussions">💬 Discussions</a> •
+  <a href="https://github.com/nikosiaf/gaggiuino-barista/tree/main/docs">📖 Full Docs</a>
+</p>

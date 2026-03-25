@@ -7,7 +7,7 @@
 # [Home Assistant](https://www.home-assistant.io/) add-on for [Gaggiuino](https://github.com/Zer0-bit/gaggiuino) espresso machines.
 Automatically detects shots, generates detailed graphs, runs a deterministic telemetry analyzer plus AI phrasing, and sends mobile push notifications with annotated graphs and next-shot tuning recommendations.
 
-**Version:** 1.1.0
+**Version:** 2.0.0
 
 ---
 
@@ -17,30 +17,74 @@ The add-on runs a background watcher polling your Gaggiuino machine every 3 seco
 
 1. Fetches the complete shot data
 2. Generates a detailed graph and saves it immediately
-3. Runs a deterministic telemetry analyzer to compute extraction features and detect events
-4. Calls Anthropic to phrase those events into labels, verdict, tuning and score (Gemini fallback uses the same schema)
-5. Re-saves the graph with AI annotations if analysis succeeds
-6. Writes shot data to `last_shot.json` and `shot_history.json`
-7. Sends a mobile push notification with the graph and AI recommendations
+3. Matches profile against bundled community profiles
+4. Runs a deterministic telemetry analyzer to compute extraction features and detect events
+5. Calls Anthropic to phrase those events into labels, verdict, tuning and score (Gemini fallback uses the same schema)
+6. Re-saves the graph with AI annotations if analysis succeeds
+7. Writes shot data to `last_shot.json` and `shot_history.json`
+8. Sends a mobile push notification with the graph and AI recommendations
 
 ---
 
-## AI architecture in 1.1.0
+## AI architecture in 2.0.0
 
-The annotation engine now has two layers:
+The annotation engine has multiple layers:
 
-1. **Deterministic telemetry analyzer**
+1. **Profile Matching**
+   - Matches shot profile against bundled community profiles by name or phase structure
+   - Derives profile-specific thresholds (lever, flow_control, pressure, filter)
+
+2. **Deterministic telemetry analyzer**
    - computes extraction features from pressure / flow / weight / temperature
+   - pre-infusion phase analysis (wetting, soaking, compression, uniformity)
+   - flow ratio tracking (weight_flow / pump_flow for channeling/restriction detection)
    - detects events like late first drops, stable core, tail runaway, target hit/miss
    - assigns severity and time anchors before any LLM is called
 
-2. **LLM phrasing layer**
+3. **Profile Adherence Scoring**
+   - Scores how well shot followed matched profile expectations
+   - Checks pressure/flow stability against profile-specific thresholds
+
+4. **Taste-Based Scoring**
+   - Produces taste profile (well_extracted/mostly_balanced/slightly_off/unbalanced/poorly_extracted)
+   - Calibrated to recognize good shots that hit targets
+
+5. **LLM phrasing layer**
    - Anthropic primary, Gemini fallback
    - rewrites detected events into short labels for the graph
    - produces a verdict, tuning recommendations, confidence, and `0-100` score
    - uses the same JSON schema for both providers
 
-This makes the output more stable because the model no longer has to infer the shot structure from raw arrays alone.
+   This makes the output more stable because the model no longer has to infer the shot structure from raw arrays alone.
+
+---
+
+## Shot Profiles
+
+The add-on includes community espresso profiles from the [Gaggiuino project](https://github.com/Zer0-bit/gaggiuino/tree/community/profiles) for automatic profile matching.
+
+**License:** These profiles are licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (Creative Commons Attribution-NonCommercial). You may use and adapt them for non-commercial purposes, provided you give appropriate credit.
+
+### Custom Profiles
+
+Users can add their own custom profiles to the add-on by placing JSON files in:
+
+```
+/homeassistant/www/gaggiuino-barista/profiles/
+```
+
+Place your profile JSON files (e.g., `my-profile.json`) in this directory. The add-on will automatically load them and use them for profile matching alongside the bundled community profiles.
+
+### Profile Matching
+
+When a shot is analyzed, the add-on first tries to match the shot's profile name to the bundled profiles. If no exact match is found, it falls back to matching by phase structure (number of phases, phase types, etc.).
+
+Matched profiles provide:
+- Profile-specific thresholds for pressure, flow, and timing
+- Expected duration ranges
+- Profile-type classification (lever, flow_control, pressure, filter)
+
+---
 
 ## ⚠️ REQUIRED: Manual steps in Home Assistant
 
@@ -81,6 +125,12 @@ rest:
           - annotations
           - features
           - detected_events
+          - profile_match_type
+          - profile_match_confidence
+          - matched_profile_name
+          - profile_adherence_score
+          - taste_profile
+          - extraction_profile
 ```
 
 Restart HA. 
@@ -114,6 +164,7 @@ In the add-on **Configuration** tab, set:
 | `anthropic_api_key` | Anthropic API key from Step 3A |
 | `gemini_api_key` | Your Gemini API key from Step 3B |
 | `ha_notify_service` | Your notify service from Step 2, e.g. `notify.mobile_app_johns_iphone` |
+| `llm_language` | Language for AI phrasing: `en` (English, 700 tokens), `el` (Greek, 1500 tokens), `it` (Italian, 1500 tokens), `de` (German, 1500 tokens), `es` (Spanish, 1500 tokens), `fr` (French, 1500 tokens). Default: `en` |
 
 ---
 
@@ -127,12 +178,10 @@ HA re-reads permissions on rebuild — required for notifications to work.
 ## 📱 Mobile notification format
 
 ```
-☕ Shot Score: 82/100
-☕ Freddo 18-54
-🌡93°C 📈9.4bar ⚖36g ⏱34s
+☕ Shot Score: 85/100 ☕
+🌡93°C 📈9.4bar ⚖48.6g ⏱33s
 
-🔧 Stop 1–2g earlier if the tail opens again
-
+🔧 Grind finer to slow the opening and build more body in the shot.
 ```
 The graph image is attached inline.
 ---
@@ -191,7 +240,7 @@ Copy `addon/gaggiuino_barista_history.py` to your HA config scripts folder:
 
 ### Optional Step C — Add sensors to configuration.yaml
 
-**Command line sensor** — reads last 5 shots + graph files (add under `command_line:`):
+**Command line sensor** — reads last 10 shots + graph files (add under `command_line:`):
 
 ```yaml
 command_line:
@@ -531,8 +580,9 @@ cards:
 |--------|----------|-------------|---------|
 | `api_base` | ✅ Yes | Gaggiuino IP or hostname | `http://gaggiuino.local` |
 | `anthropic_api_key` | Recommended | Anthropic API key (reliable, ~$0.001/shot) | `sk-ant-...` |
-| `gemini_api_key` | ✅ Yes | Google Gemini API key | `AIzaSy...` |
+| `gemini_api_key` | No | Google Gemini API key (fallback if Anthropic unavailable) | `AIzaSy...` |
 | `ha_notify_service` | ✅ Yes | HA notify service for your phone | `notify.mobile_app_johns_iphone` |
+| `llm_language` | No | Language for AI phrasing | `en`, `el`, `it`, `de`, `es`, `fr` |
 
 ---
 
@@ -632,3 +682,38 @@ Last shot always available at `/local/gaggiuino-barista/last_shot.png`
 - Install `config-template-card` from HACS → Frontend
 - Verify `sensor.gaggiuino_barista_graph_1` has a state in Developer Tools → States
 - Pull a shot and wait 30s for the command_line sensor to refresh
+
+**Language selection not working**
+- Make sure you set `llm_language` in the add-on configuration
+- After changing language, click **Rebuild** (not just Restart) to apply changes
+- Verify log shows `LLM Language: Greek` (or your chosen language) after rebuild
+- If using a non-English language, ensure the LLM response isn't truncated (tokens set to 1500 for non-English)
+
+---
+
+## Understanding the Score
+
+The shot score (0-100) is calculated from deterministic analysis:
+
+| Score | Rating | Meaning |
+|-------|--------|---------|
+| 80+ | Excellent | Shot hit targets, stable extraction, well-balanced |
+| 70-79 | Good | Minor issues, still a pleasant shot |
+| 60-69 | Drinkable | Noticeable issues, consider adjustments |
+| <60 | Problematic | Significant problems detected |
+
+**Score factors:**
+- Target yield hit (+10 bonus)
+- First drops timing (on time = +2)
+- Pressure stability (stable = +3)
+- Flow stability (stable = +3)
+- Flow rate on target (+2)
+- Taste profile classification (-20 to +0)
+- Severity penalties (warnings = -2 each)
+
+**Taste profiles:**
+- `well_extracted` - Good extraction balance
+- `mostly_balanced` - Slightly off but acceptable
+- `slightly_off` - Noticeable deviation
+- `unbalanced` - Significant problems
+- `poorly_extracted` - Major issues

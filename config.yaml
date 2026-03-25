@@ -1,41 +1,71 @@
+# Gaggiuino Barista - Home Assistant Add-on Configuration
+#
+# This is the main configuration file for the Home Assistant add-on.
+# It defines the add-on metadata, configuration options, and Docker settings.
+
 name: Gaggiuino Barista
 slug: gaggiuino_barista
-version: "1.1.0"
-description: Automatically detects shots, generates detailed graphs, runs a deterministic telemetry analyzer plus AI phrasing, and sends mobile push notifications with annotated graphs and next-shot tuning recommendations.
+version: "2.0.0"
+description: >
+  Your espresso shot analyst!
+  Auto-detect shots, get beautiful graphs with AI-powered insights,
+  and improve your extraction with smart tuning tips delivered to your phone
 url: https://github.com/nikosiaf/gaggiuino-barista
+
+# Supported architectures
 arch:
   - amd64
   - aarch64
   - armv7
   - armhf
   - i386
+
+# Start as a background service (not 'application' which blocks HA startup)
 startup: services
+# Auto-start when Home Assistant starts
 boot: auto
+# Don't run init script (we handle our own process management)
 init: false
+# Enable host network access (needed to communicate with Gaggiuino machine)
 host_network: true
 
+# Expose port 5000 for the web server (manual plot trigger, status endpoint)
 ports:
   5000/tcp: 5000
 
+# Enable Home Assistant API access for notifications and sensor checks
 hassio_api: true
 hassio_role: default
 homeassistant_api: true
 
+# Default configuration values (user overrides in add-on UI)
 options:
+  # Gaggiuino API base URL - can be hostname or IP address
   api_base: "http://gaggiuino.local"
+  # Anthropic API key for Claude Haiku (primary AI provider, ~$0.001/shot)
   anthropic_api_key: ""
+  # Google Gemini API key (fallback AI provider, free tier available)
   gemini_api_key: ""
+  # Home Assistant notify service for mobile notifications
+  # Format: notify.mobile_app_your_phone
   ha_notify_service: "notify.mobile_app_your_phone"
+  # Language for AI analysis output: en, el, it, de, es, fr
+  llm_language: "en"
 
+# Configuration schema (all fields are strings)
 schema:
   api_base: str
   anthropic_api_key: str
   gemini_api_key: str
   ha_notify_service: str
+  llm_language: str
 
+# File system mappings
 map:
+  # Allow read/write access to add-on config directory (for custom profiles)
   - type: addon_config
     read_only: false
+  # Access to Home Assistant config (for www directory)
   - type: homeassistant_config
     read_only: false
     path: /homeassistant

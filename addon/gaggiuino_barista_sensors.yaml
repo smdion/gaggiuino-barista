@@ -1,7 +1,6 @@
 # ============================================================
-# FIX 1: REST sensor URL
-# Replace "localhost" with your actual HA IP address
-# Add under "rest:" in configuration.yaml
+# REST sensor for last shot data (add under "rest:" in configuration.yaml)
+# Replace "homeassistant.local" with your actual HA hostname/IP
 # ============================================================
 #
 # rest:
@@ -22,10 +21,21 @@
 #           - water_temp_c
 #           - history_count
 #           - ai_available
+#           - ai_provider
+#           - score
+#           - confidence
 #           - verdict
 #           - tuning
 #           - notification_text
 #           - annotations
+#           - features
+#           - detected_events
+#           - profile_match_type
+#           - profile_match_confidence
+#           - matched_profile_name
+#           - profile_adherence_score
+#           - taste_profile
+#           - extraction_profile
 
 # ── Card 1: Last Espresso Shot ───────────
 

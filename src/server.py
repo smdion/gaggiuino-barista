@@ -1,3 +1,30 @@
+"""
+Gaggiuino Barista - Server Module
+
+This module runs as the main entry point for the Home Assistant add-on.
+It provides:
+- A background watcher that detects espresso shots from the Gaggiuino machine
+- Shot detection via brew switch state + shot ID confirmation
+- Flask web server for manual plot triggering and status queries
+- Mobile push notifications via Home Assistant Companion app
+
+The watcher polls the Gaggiuino machine every 3 seconds. When a shot is detected:
+1. Waits for the shot to be saved (shot ID increments)
+2. Spawns a subprocess to generate the shot graph and run AI analysis
+3. Sends a mobile notification with the annotated graph
+
+Shot detection logic:
+- Primary: Brew switch turns ON -> OFF
+- Fallback: Pressure >= 2.0 bar (for machines with unreliable brew switch)
+- Suppression: Pressure fallback ignored for 60s after a shot ends (residual pressure)
+
+Environment variables (set via config.yaml / run.sh):
+- API_BASE: Gaggiuino API base URL (default: http://gaggiuino.local)
+- SUPERVISOR_TOKEN: Home Assistant Supervisor API token
+- HA_NOTIFY_SERVICE: HA notify service (e.g., notify.mobile_app_your_phone)
+- LLM_LANGUAGE: Language for AI analysis (en, el, it, de, es, fr)
+"""
+
 import os
 import time
 import json
@@ -7,135 +34,191 @@ from datetime import datetime
 from flask import Flask, jsonify
 import requests
 
+
+# =========================
+# FLASK APP SETUP
+# =========================
 app = Flask(__name__)
 
-# =========================
-# CONFIG
-# =========================
-API_BASE        = os.getenv("API_BASE", "http://gaggiuino.local")
-POLL_INTERVAL   = 3
-SHOT_ID_POLL    = 5
-POST_SHOT_DELAY = 8
-MIN_SHOT_SECS   = 8
-MAX_SHOT_SECS   = 180
-TIMEOUT         = 5
 
+# =========================
+# CONFIGURATION
+# =========================
+# Polling intervals (seconds)
+API_BASE        = os.getenv("API_BASE", "http://gaggiuino.local")
+POLL_INTERVAL   = 3          # How often to check machine status during normal operation
+SHOT_ID_POLL    = 5          # How often to poll for new shot ID while waiting for save
+POST_SHOT_DELAY = 8          # Wait time after shot ends before fetching data (allows Gaggiuino to save)
+MIN_SHOT_SECS   = 8          # Minimum shot duration to be considered valid (ignore flushes, etc.)
+MAX_SHOT_SECS   = 180        # Maximum shot duration (ignore accidental left-on machines)
+TIMEOUT         = 5          # HTTP request timeout when talking to Gaggiuino
+
+# Home Assistant integration
 HA_TOKEN          = os.getenv("SUPERVISOR_TOKEN", "")
 HA_BASE           = "http://supervisor/core/api"
 HA_NOTIFY_SERVICE = os.getenv("HA_NOTIFY_SERVICE", "notify.mobile_app_your_phone")
 
+# Language configuration for AI analysis
+LLM_LANGUAGE  = os.getenv("LLM_LANGUAGE", "en")
+LANGUAGES     = {"en": "English", "el": "Greek", "it": "Italian", "de": "German", "es": "Spanish", "fr": "French"}
+
+
 # =========================
-# STATE
+# WATCHER STATE
 # =========================
+# Shared state between watcher thread and web server
+# Used to track shot detection progress and machine status
 state = {
-    "known_shot_id":      None,
-    "shot_running":       False,
-    "shot_started_at":    None,
-    "last_shot_ended_at": None,   # cooldown for pressure fallback trigger
-    "last_plot":          None,
-    "last_error":         None,
-    "status":             "idle",
+    "known_shot_id":      None,   # Last known shot ID (prevents re-triggering on old shots)
+    "shot_running":        False,  # True when brew switch is on
+    "shot_started_at":     None,   # Timestamp when current shot started
+    "last_shot_ended_at":  None,   # Timestamp for cooldown on pressure fallback trigger
+    "last_plot":           None,   # ISO timestamp of last successful plot
+    "last_error":          None,   # Last error message (for status endpoint)
+    "status":              "idle", # Current status: idle, plotting, offline, error
 }
 
+
 # =========================
-# HELPERS
+# LOGGING HELPER
 # =========================
 def log(msg: str):
+    """Print timestamped log message to stdout (captured by Docker/HA logs)."""
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
+
+# =========================
+# HOME ASSISTANT NOTIFICATIONS
+# =========================
 def send_notification(summary: dict, analysis: dict):
-    """Send HA mobile notification from server.py where SUPERVISOR_TOKEN is valid."""
+    """
+    Send mobile push notification via Home Assistant Companion app.
+    
+    Args:
+        summary: Shot metadata dict (duration, weight, pressure, temp, profile)
+        analysis: AI analysis dict (score, verdict, tuning, notification_text)
+    
+    The notification includes:
+    - Title with shot score (e.g., "☕ Shot Score: 82/100 ☕")
+    - Shot parameters (temp, pressure, weight, duration)
+    - First tuning tip from AI analysis
+    - Inline graph image
+    
+    Note: Called from server.py where SUPERVISOR_TOKEN is valid.
+          plot_logic.py cannot send notifications directly (token not inherited).
+    """
+    # Check if we have a valid HA token
     if not HA_TOKEN:
         log("WARNING: SUPERVISOR_TOKEN not set - skipping notification")
         return
 
-    # profile  = summary.get("profile", "unknown")
+    # Extract shot parameters
     duration = summary.get("duration_s", "")
     weight   = summary.get("final_weight_g", "")
     target_w = summary.get("target_weight_g", "")
     pressure = summary.get("max_pressure_bar", "")
     temp     = summary.get("water_temp_c", "")
-    # provider = summary.get("ai_provider", "")
+    
+    # Build notification title (includes shot score if available)
     title = "\u2615 Espresso Shot Done \u2615"
     
-    # Build target weight string
+    # Format yield string (e.g., "36g/38g" or just "36g" if no target)
     yield_str = f"{weight}g/{target_w}g" if target_w and target_w != "-" else f"{weight}g"
 
+    # Build notification body
     lines = [
-        # f"\u2615 {profile}",
-        # f"\u23f1 {duration}s   \u2696 {yield_str}   \U0001f4c8 {pressure} bar   \U0001f321 {temp}\u00b0C",
-        f"\U0001f321{temp}\u00b0C \U0001f4c8{pressure}bar \u2696{weight} \u23f1{duration}s",
+        f"\U0001f321{temp}\u00b0C \U0001f4c8{pressure}bar \u2696{yield_str} \u23f1{duration}s",
     ]
     
+    # Add AI analysis results if available
     if analysis:
-        # text  = analysis.get("notification_text", "")
         tuning = analysis.get("tuning", [])
-        # verdict = analysis.get("verdict", "")
         shot_score = analysis.get("score")
+        
+        # Include score in title if available
         if shot_score:
             try:
                 title = f"\u2615 Shot Score: {int(round(float(shot_score)))}/100 \u2615\n"
             except Exception:
-                title = "Espresso Shot Done !"        
-        # if verdict:
-        #     lines.append(f"\n\U0001f9e0 {verdict}")
-        if tuning:       
-            # lines.append(f"\n\U0001f527 {tuning[:3]}")
-            for tip in tuning[:1]:
-                lines.append(f"\n\U0001f527 {tip}")
+                title = "Espresso Shot Done !"
+        
+        # Include first tuning tip
+        if tuning:
+            lines.append(f"\n\U0001f527 {tuning[0]}")
     else:
         lines.append("\n\U0001f916 AI analysis unavailable")
 
-    url = f"{HA_BASE}/services/{HA_NOTIFY_SERVICE.replace('.', '/')}"
-
-    # Resolve graph URL — try Supervisor API first, fall back to env, then relative path
+    # Build notification payload for HA API
+    notify_url = f"{HA_BASE}/services/{HA_NOTIFY_SERVICE.replace('.', '/')}"
+    
+    # Resolve the graph URL - try Supervisor API first, fall back to relative path
+    # The relative path works when accessed from within HA network
     graph_path = "/local/gaggiuino-barista/last_shot.png"
     ha_base_url = os.getenv("HA_BASE_URL", "").rstrip("/")
+    
+    # Try to get HA base URL from Supervisor config
     if not ha_base_url:
         try:
             cfg = requests.get(
                 "http://supervisor/core/api/config",
-                headers={"Authorization": f"Bearer {HA_TOKEN}",
-                         "Content-Type": "application/json"},
+                headers={"Authorization": f"Bearer {HA_TOKEN}"},
                 timeout=5,
             ).json()
+            # Use external_url (public) or internal_url (local) as base
             ha_base_url = (cfg.get("external_url") or cfg.get("internal_url") or "").rstrip("/")
         except Exception as e:
             log(f"WARNING: Could not fetch HA base URL from Supervisor: {e}")
 
+    # Build full graph URL if we have a base, otherwise use relative path
     graph_url = f"{ha_base_url}{graph_path}" if ha_base_url else graph_path
 
+    # Construct the notification payload
     payload = {
-        # "title": "\u2615 Espresso Shot Done",
         "title": title,
         "message": "\n".join(lines),
         "data": {
-            # "image": "/local/gaggiuino-barista/last_shot.png",
-            "image": graph_path,
-            "url": graph_url,
+            "image": graph_path,      # Relative path for HA Companion app
+            "url": graph_url,         # Full URL for tapping notification
             "push": {"sound": "default"},
         },
     }
+    
+    # Send the notification via HA API
     try:
-        r = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {HA_TOKEN}",
-                     "Content-Type": "application/json"},
+        response = requests.post(
+            notify_url,
+            headers={
+                "Authorization": f"Bearer {HA_TOKEN}",
+                "Content-Type": "application/json",
+            },
             json=payload,
             timeout=10,
         )
-        log(f"Notification response: HTTP {r.status_code} - {r.text[:100]}")
+        log(f"Notification response: HTTP {response.status_code} - {response.text[:100]}")
     except Exception as e:
         log(f"WARNING: Notification failed: {e}")
 
 
+# =========================
+# GAGGIUINO API HELPERS
+# =========================
 def get_machine_status() -> dict | None:
+    """
+    Fetch current machine status from Gaggiuino API.
+    
+    Returns:
+        Dict with pressure, brew_switch, temperature, weight, profile
+        or None if machine is unreachable.
+    """
     try:
-        r = requests.get(f"{API_BASE}/api/system/status", timeout=TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
+        response = requests.get(f"{API_BASE}/api/system/status", timeout=TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Handle both list and dict responses
         if isinstance(data, list):
             data = data[0]
+        
         return {
             "pressure":    float(data.get("pressure", 0)),
             "brew_switch": bool(data.get("brewSwitchState", False)),
@@ -148,35 +231,76 @@ def get_machine_status() -> dict | None:
 
 
 def get_latest_shot_id() -> int | None:
+    """
+    Get the most recent shot ID from Gaggiuino.
+    
+    Returns:
+        Integer shot ID, or None if unavailable.
+    """
     try:
-        r = requests.get(f"{API_BASE}/api/shots/latest", timeout=TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
+        response = requests.get(f"{API_BASE}/api/shots/latest", timeout=TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Handle both list and dict responses
         if isinstance(data, list) and data:
             data = data[0]
+        
+        # Extract shot ID from various possible field names
         shot_id = data.get("lastShotId") or data.get("id")
         return int(shot_id) if shot_id is not None else None
     except Exception:
         return None
 
 
+# =========================
+# SHOT PLOTTING
+# =========================
 def run_plot(shot_id: int, duration: float):
+    """
+    Spawn subprocess to generate shot graph and run AI analysis.
+    
+    This runs in a separate thread to avoid blocking the watcher.
+    The subprocess runs plot_logic.py which:
+    1. Fetches complete shot data from Gaggiuino
+    2. Generates the shot graph image
+    3. Runs deterministic telemetry analysis
+    4. Calls AI (Anthropic/Gemini) for phrasing
+    5. Saves graph with AI annotations
+    6. Writes JSON data files
+    7. Prints SUMMARY: JSON to stdout
+    
+    Args:
+        shot_id: The Gaggiuino shot ID to plot
+        duration: Shot duration in seconds (for logging)
+    """
     log(f"Waiting {POST_SHOT_DELAY}s for Gaggiuino to finalize shot recording...")
     time.sleep(POST_SHOT_DELAY)
     log(f"Starting plot for shot #{shot_id} (duration ~{duration:.0f}s)...")
+    
     state["status"] = "plotting"
+    
     try:
+        # Pass all environment variables to subprocess (including LLM_LANGUAGE)
+        env = os.environ.copy()
+        log(f"LLM_LANGUAGE env = {LANGUAGES.get(env.get('LLM_LANGUAGE', ''), env.get('LLM_LANGUAGE', 'NOT SET'))}")
+        
+        # Run plot_logic.py as subprocess
         result = subprocess.run(
             ["python", "/app/src/plot_logic.py"],
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=300,  # 5 minute timeout for plot generation
+            env=env,      # Pass environment including API keys and language setting
         )
+        
         if result.returncode == 0:
+            # Success - parse output and send notification
             state["last_plot"] = datetime.now().isoformat()
             state["last_error"] = None
             state["status"] = "idle"
-            # Parse summary JSON from stdout for notification
+            
+            # Parse SUMMARY: JSON from stdout
             summary = {}
             analysis = {}
             for line in result.stdout.strip().splitlines():
@@ -192,21 +316,26 @@ def run_plot(shot_id: int, duration: float):
                     except Exception:
                         log(f"  -> {line}")
                 elif line.startswith("WARNING") or "Gemini" in line or "Anthropic" in line:
+                    # Log AI-related messages with [AI] prefix
                     log(f"  [AI] {line}")
                 else:
                     log(f"  -> {line}")
+            
             log("Plot completed successfully.")
             send_notification(summary, analysis)
         else:
+            # Plot failed - log errors
             state["last_error"] = result.stderr.strip()
             state["status"] = "error"
             log("Plot FAILED:")
             for line in result.stderr.strip().splitlines():
                 log(f"  {line}")
+                
     except subprocess.TimeoutExpired:
         state["last_error"] = "Plot timed out after 300s"
         state["status"] = "error"
         log("Plot TIMED OUT after 300s")
+        
     except Exception as e:
         state["last_error"] = str(e)
         state["status"] = "error"
@@ -214,16 +343,31 @@ def run_plot(shot_id: int, duration: float):
 
 
 # =========================
-# WATCHER LOOP
+# SHOT DETECTION WATCHER
 # =========================
 def watcher():
+    """
+    Background thread that continuously polls Gaggiuino for shot detection.
+    
+    Detection logic:
+    1. Brew switch ON -> shot starts
+    2. Brew switch OFF -> shot ends (primary method)
+    3. Pressure >= 2.0 bar -> shot starts (fallback for unreliable brew switch)
+    4. Waits for shot ID to increment before triggering plot (confirms save)
+    
+    Suppressions:
+    - Pressure fallback ignored for 60s after shot ends (residual pressure)
+    - Shots shorter than MIN_SHOT_SECS or longer than MAX_SHOT_SECS ignored
+    
+    Runs forever in a daemon thread until container stops.
+    """
     log("Watcher started - detecting shots via brew switch + shot ID change...")
     offline = False
 
     while True:
         machine = get_machine_status()
 
-        # --- offline handling ---
+        # --- Handle offline machine ---
         if machine is None:
             if not offline:
                 log("Machine unreachable - switching to 30s polling interval")
@@ -234,11 +378,12 @@ def watcher():
             time.sleep(30)
             continue
 
+        # --- Machine came back online ---
         if offline:
             log(f"Machine back online | profile={machine['profile']} temp={machine['temperature']:.1f}C")
             offline = False
             state["status"] = "idle"
-            # Re-learn current shot ID so we don't false-trigger on startup
+            # Re-learn current shot ID to prevent false trigger on startup
             state["known_shot_id"] = get_latest_shot_id()
             log(f"Current shot ID: {state['known_shot_id']}")
 
@@ -246,29 +391,30 @@ def watcher():
         brew_switch = machine["brew_switch"]
         elapsed     = time.time() - state["shot_started_at"] if state["shot_started_at"] else 0
 
-        # --- verbose log every 10s during active shot ---
+        # --- Verbose logging during active shot (every 10s) ---
         if state["shot_running"] and elapsed > 0 and int(elapsed) % 10 < POLL_INTERVAL:
             log(f"  [shot {elapsed:.0f}s] brew_switch={brew_switch} pressure={pressure:.2f}bar weight={machine['weight']:.1f}g")
 
-        # --- shot START: brew switch turned on ---
+        # --- SHOT START: Brew switch turned on ---
         if not state["shot_running"] and brew_switch:
             state["shot_running"] = True
             state["shot_started_at"] = time.time()
             log(f"Shot STARTED (brew switch) | profile={machine['profile']} temp={machine['temperature']:.1f}C")
 
-        # --- shot START fallback: pressure spike (brew switch unreliable) ---
-        # Suppressed for 60s after a shot ends to avoid residual pressure triggers
+        # --- SHOT START FALLBACK: Pressure spike ---
+        # Used when brew switch is unreliable
+        # Suppressed for 60s after shot ends to avoid residual pressure triggers
         elif not state["shot_running"] and pressure >= 2.0:
             ended_at = state["last_shot_ended_at"]
             cooldown_elapsed = time.time() - ended_at if ended_at else 999
             if cooldown_elapsed < 60:
-                pass  # silently ignore — residual pressure after shot
+                pass  # Silently ignore - residual pressure after shot
             else:
                 state["shot_running"] = True
                 state["shot_started_at"] = time.time()
                 log(f"Shot STARTED (pressure {pressure:.2f}bar) | profile={machine['profile']}")
 
-        # --- shot END: brew switch turned off ---
+        # --- SHOT END: Brew switch turned off ---
         elif state["shot_running"] and not brew_switch:
             duration = time.time() - state["shot_started_at"]
             state["shot_running"] = False
@@ -276,17 +422,19 @@ def watcher():
             state["last_shot_ended_at"] = time.time()
             log(f"Shot END signal | duration={duration:.0f}s pressure={pressure:.2f}bar")
 
+            # Validate shot duration
             if duration < MIN_SHOT_SECS:
                 log(f"Ignored - too short ({duration:.0f}s)")
             elif duration > MAX_SHOT_SECS:
                 log(f"Ignored - too long ({duration:.0f}s)")
             else:
-                # Wait for shot ID to increment - confirms Gaggiuino saved it
+                # Wait for shot ID to increment - confirms Gaggiuino saved the shot
                 log("Waiting for Gaggiuino to save shot record...")
                 saved_id = _wait_for_new_shot_id(timeout=30)
                 if saved_id:
                     log(f"New shot ID detected: #{saved_id} - triggering plot")
                     state["known_shot_id"] = saved_id
+                    # Run plot in separate thread to avoid blocking watcher
                     threading.Thread(
                         target=run_plot,
                         args=(saved_id, duration),
@@ -299,39 +447,71 @@ def watcher():
 
 
 def _wait_for_new_shot_id(timeout: int = 30) -> int | None:
-    """Poll until shot ID increments, return new ID or None on timeout."""
+    """
+    Poll until the shot ID increments (confirming Gaggiuino saved the shot).
+    
+    This prevents triggering plot before Gaggiuino has finished writing the shot data.
+    
+    Args:
+        timeout: Maximum seconds to wait for new shot ID (default 30s)
+    
+    Returns:
+        New shot ID if detected, or None on timeout.
+    """
     deadline = time.time() + timeout
     current_id = state["known_shot_id"]
+    
     while time.time() < deadline:
         new_id = get_latest_shot_id()
         if new_id is not None and (current_id is None or new_id > current_id):
             return new_id
-        time.sleep(2)
+        time.sleep(2)  # Poll every 2s while waiting
+    
     return None
 
 
 # =========================
-# FLASK ROUTES
+# FLASK WEB ROUTES
 # =========================
 @app.route("/plot/latest", methods=["POST", "GET"])
 def plot_latest():
+    """
+    Manual trigger endpoint for plotting the latest shot.
+    
+    POST/GET /plot/latest
+    
+    Use cases:
+    - Manual trigger from Home Assistant dashboard button
+    - Re-generate plot for a specific shot
+    - Test the add-on without pulling a new shot
+    
+    Returns:
+        JSON with ok=True and stdout on success, or error details on failure.
+    """
     machine = get_machine_status()
     if machine is None:
         return jsonify({"ok": False, "error": "Gaggiuino unreachable - machine may be offline"}), 503
+    
     shot_id = get_latest_shot_id()
     log(f"Manual plot triggered | shot_id={shot_id} profile={machine['profile']}")
+    
     try:
+        env = os.environ.copy()
+        log(f"LLM_LANGUAGE env = {LANGUAGES.get(env.get('LLM_LANGUAGE', ''), env.get('LLM_LANGUAGE', 'NOT SET'))}")
+        
         result = subprocess.run(
             ["python", "/app/src/plot_logic.py"],
             capture_output=True, text=True, timeout=300,
+            env=env,
         )
+        
         if result.returncode != 0:
             log("Manual plot FAILED:")
             for line in result.stderr.strip().splitlines():
                 log(f"  {line}")
             return jsonify({"ok": False, "stderr": result.stderr}), 500
 
-        # Log all stdout lines so we can see AI analysis progress
+        # Parse output and send notification
         summary = {}
         analysis = {}
         for line in result.stdout.strip().splitlines():
@@ -339,8 +519,8 @@ def plot_latest():
                 try:
                     summary = json.loads(line[8:])
                     analysis = {
-                        "verdict":           summary.get("verdict", ""),
-                        "tuning":            summary.get("tuning", []),
+                        "verdict": summary.get("verdict", ""),
+                        "tuning": summary.get("tuning", []),
                         "score": summary.get("score", 0),
                         "notification_text": summary.get("notification_text", ""),
                     }
@@ -355,17 +535,34 @@ def plot_latest():
         log("Manual plot completed.")
         send_notification(summary, analysis)
         return jsonify({"ok": True, "stdout": result.stdout})
+        
     except subprocess.TimeoutExpired:
         log("Manual plot TIMED OUT after 300s")
         return jsonify({"ok": False, "error": "Plot timed out"}), 500
+        
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/status", methods=["GET"])
 def status():
+    """
+    Health check and status endpoint.
+    
+    GET /status
+    
+    Returns current watcher state, machine status, and last plot info.
+    Useful for:
+    - Dashboard sensors
+    - Troubleshooting
+    - Automation triggers
+    
+    Returns:
+        JSON with watcher_status, shot_running, machine data, etc.
+    """
     machine = get_machine_status()
     elapsed = time.time() - state["shot_started_at"] if state["shot_started_at"] else None
+    
     return jsonify({
         "watcher_status": state["status"],
         "shot_running":   state["shot_running"],
@@ -378,11 +575,12 @@ def status():
 
 
 # =========================
-# STARTUP
+# STARTUP SEQUENCE
 # =========================
 import pathlib
 import sys
 
+# Ensure output directory exists
 _www_dir = pathlib.Path("/homeassistant/www/gaggiuino-barista")
 if not _www_dir.exists():
     _www_dir.mkdir(parents=True, exist_ok=True)
@@ -390,7 +588,8 @@ if not _www_dir.exists():
 else:
     log(f"Output directory exists: {_www_dir}")
 
-# --- Check REST sensor is configured in HA ---
+# Verify REST sensor is configured in Home Assistant
+# This sensor reads last_shot.json and exposes it as an entity for dashboards
 log("Checking HA REST sensor configuration...")
 try:
     _sensor_check = requests.get(
@@ -414,6 +613,10 @@ try:
 except Exception as e:
     log(f"WARNING: Could not check REST sensor (Supervisor API unavailable?): {e}")
 
+# Log configured language
+log(f"LLM Language: {LANGUAGES.get(LLM_LANGUAGE, LLM_LANGUAGE)}")
+
+# Check machine connectivity
 log("Checking machine status on startup...")
 startup_status = get_machine_status()
 if startup_status:
@@ -424,9 +627,11 @@ if startup_status:
 else:
     log("Machine OFFLINE at startup - watcher will detect when it comes back")
 
+# Start background watcher thread
 log("Starting watcher thread...")
 threading.Thread(target=watcher, daemon=True).start()
 
+# Start web server on port 5000
 log("Starting web server on port 5000...")
 try:
     from waitress import serve

@@ -1,3 +1,38 @@
+"""
+Gaggiuino Barista - Plot Generation Module
+
+This module generates detailed espresso shot graphs and runs AI analysis.
+It is invoked as a subprocess by server.py after a shot is detected.
+
+Workflow:
+1. Fetch complete shot data from Gaggiuino API
+2. Generate the shot graph image with all telemetry curves
+3. Run deterministic telemetry analysis (feature extraction + event detection)
+4. Call AI (Anthropic primary, Gemini fallback) for natural language phrasing
+5. Overlay AI annotations on the graph
+6. Write JSON data files (last_shot.json, shot_history.json)
+7. Print SUMMARY: JSON to stdout for parent process
+
+The graph includes:
+- Temperature curve (left axis, orange)
+- Pressure curve with target (right axis, blue)
+- Pump flow with target (right axis, yellow)
+- Weight flow rate (right axis, green)
+- Shot weight accumulation (right axis, purple)
+- Phase background shading (pre-infusion, main extraction, final)
+- AI annotations with severity-based coloring
+- Score stamp in top-left corner
+- Verdict panel with AI assessment
+- Tuning panel with next-shot recommendations
+
+Environment variables (inherited from server.py):
+- API_BASE: Gaggiuino API base URL
+- OUT_DIR: Output directory for graphs and JSON files
+- GEMINI_API_KEY: Google Gemini API key (fallback)
+- ANTHROPIC_API_KEY: Anthropic API key (primary)
+- LLM_LANGUAGE: Language for AI output (en, el, it, de, es, fr)
+"""
+
 import json
 import os
 import shutil
@@ -6,7 +41,7 @@ from datetime import datetime
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # Non-interactive backend for server environments
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import requests
@@ -16,20 +51,23 @@ import sys
 logger = logging.getLogger(__name__)
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+# Import analysis engine for deterministic feature extraction and event detection
 from annotation_engine import extract_features, detect_events, classify_extraction_tendency, summarize_for_prompt
 
 
 # =========================
-# THEME
+# THEME & COLORS
 # =========================
-DARK_BG = "#061225"
-HEADER_BG = "#0c1830"
-GRID_COLOR = "#1a2942"
-SPINE_COLOR = "#2b3b56"
-TEXT_LIGHT = "#cbd5e1"
-TEXT_DIM = "#94a3b8"
-TEXT_BOX = "#e5e7eb"
+# Dark theme colors for the shot graph
+DARK_BG = "#061225"        # Main background color
+HEADER_BG = "#0c1830"      # Header strip background
+GRID_COLOR = "#1a2942"     # Grid lines
+SPINE_COLOR = "#2b3b56"    # Axis spines
+TEXT_LIGHT = "#cbd5e1"     # Primary text color
+TEXT_DIM = "#94a3b8"       # Secondary/dim text
+TEXT_BOX = "#e5e7eb"       # Box text color
 
+# Apply dark theme to all matplotlib figures globally
 plt.rcParams["figure.facecolor"] = DARK_BG
 plt.rcParams["axes.facecolor"] = DARK_BG
 plt.rcParams["savefig.facecolor"] = DARK_BG
@@ -38,56 +76,133 @@ plt.rcParams["font.size"] = 10
 
 
 # =========================
-# CONFIG
+# CONFIGURATION
 # =========================
 API_BASE = os.getenv("API_BASE", "http://gaggiuino.local")
-OUT_DIR = Path("/homeassistant/www/gaggiuino-barista")
-LAST_FILE = OUT_DIR / "last_shot.png"
-TIMEOUT = 10
-MAX_HISTORY = 30
+OUT_DIR = Path("/homeassistant/www/gaggiuino-barista")  # Output directory for all generated files
+LAST_FILE = OUT_DIR / "last_shot.png"                 # Always points to latest shot graph
+TIMEOUT = 10                                           # HTTP request timeout
+MAX_HISTORY = 30                                       # Maximum number of historical graphs to keep
 
+# AI API keys (set via run.sh / config.yaml)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# Home Assistant integration
 HA_TOKEN = os.getenv("SUPERVISOR_TOKEN", "")
 HA_BASE = "http://supervisor/core/api"
 HA_NOTIFY_SERVICE = os.getenv("HA_NOTIFY_SERVICE", "notify.mobile_app_your_phone")
 
+# Language configuration for AI output
+LLM_LANGUAGE = os.getenv("LLM_LANGUAGE", "en")
+
+# Language-specific prompts for LLM output
+# Each language has:
+# - instruction: How the LLM should respond
+# - verdict_hint: Description of what the verdict field should contain
+# - tuning_hint: Description of what tuning recommendations should be
+# - notification_hint: Description of notification text format
+# - language: The language name in English
+LANGUAGE_PROMPTS = {
+    "en": {
+        "instruction": "Respond with valid JSON only. No markdown. No extra text.",
+        "verdict_hint": "one sentence overall assessment",
+        "tuning_hint": "actionable recommendation",
+        "notification_hint": "2 short sentences for mobile push",
+        "language": "English",
+    },
+    "el": {
+        "instruction": "Respond with valid JSON only. No markdown. No extra text. Respond in Greek.",
+        "verdict_hint": "μία πρόταση συνολικής αξιολόγησης στα Ελληνικά",
+        "tuning_hint": "πρακτική σύσταση",
+        "notification_hint": "2 σύντομες προτάσεις για ειδοποίηση κινητού",
+        "language": "Greek",
+    },
+    "it": {
+        "instruction": "Rispondi solo con JSON valido. Nessun markdown. Nessun testo extra. Rispondi in italiano.",
+        "verdict_hint": "una frase di valutazione complessiva in italiano",
+        "tuning_hint": "raccomandazione praticabile",
+        "notification_hint": "2 frasi brevi per notifica mobile",
+        "language": "Italian",
+    },
+    "de": {
+        "instruction": "Antworten Sie nur mit gültigem JSON. Kein Markdown. Kein zusätzlicher Text. Antworten Sie auf Deutsch.",
+        "verdict_hint": "ein Satz zur Gesamtbewertung auf Deutsch",
+        "tuning_hint": "umsetzbare Empfehlung",
+        "notification_hint": "2 kurze Sätze für Mobile-Benachrichtigung",
+        "language": "German",
+    },
+    "es": {
+        "instruction": "Responde solo con JSON válido. Sin markdown. Sin texto extra. Responde en español.",
+        "verdict_hint": "una frase de evaluación general en español",
+        "tuning_hint": "recomandación práctica",
+        "notification_hint": "2 frases cortas para notificación móvil",
+        "language": "Spanish",
+    },
+    "fr": {
+        "instruction": "Répondez uniquement en JSON valide. Pas de markdown. Pas de texte supplémentaire. Répondez en français.",
+        "verdict_hint": "une phrase d'évaluation globale en français",
+        "tuning_hint": "recommandation pratique",
+        "notification_hint": "2 phrases courtes pour notification mobile",
+        "language": "French",
+    },
+}
+
+
+def get_language_config():
+    """Get the language configuration for the current LLM_LANGUAGE setting."""
+    lang = LLM_LANGUAGE.lower().strip()
+    return LANGUAGE_PROMPTS.get(lang, LANGUAGE_PROMPTS["en"])
+
 
 # =========================
-# COLORS
+# COLOR PALETTE
 # =========================
-COLOR_TEMP = "#ff5a2f"
-COLOR_TEMP_TARGET = "#ff5a2f"
+# Color scheme for telemetry curves
+COLOR_TEMP = "#ff5a2f"           # Temperature (orange)
+COLOR_TEMP_TARGET = "#ff5a2f"    # Target temperature (orange dashed)
 
-COLOR_PRESSURE = "#3b82f6"
-COLOR_PRESSURE_TARGET = "#60a5fa"
+COLOR_PRESSURE = "#3b82f6"       # Actual pressure (blue)
+COLOR_PRESSURE_TARGET = "#60a5fa" # Target pressure (blue dashed)
 
-COLOR_FLOW = "#facc15"
-COLOR_FLOW_TARGET = "#eab308"
+COLOR_FLOW = "#facc15"           # Pump flow (yellow)
+COLOR_FLOW_TARGET = "#eab308"    # Target pump flow (yellow dashed)
 
-COLOR_WEIGHT_FLOW = "#22c55e"
-COLOR_WEIGHT = "#a855f7"
+COLOR_WEIGHT_FLOW = "#22c55e"    # Weight flow rate (green)
+COLOR_WEIGHT = "#a855f7"         # Shot weight accumulation (purple)
 
 
 # =========================
-# HELPERS
+# API HELPERS
 # =========================
 def get_json(url: str):
-    r = requests.get(url, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+    """Fetch JSON from a URL with error handling."""
+    response = requests.get(url, timeout=TIMEOUT)
+    response.raise_for_status()
+    return response.json()
 
 
+# =========================
+# DATA PROCESSING
+# =========================
 def scale_list(values, factor=1.0):
+    """Scale all values in a list by a factor (e.g., convert units)."""
     return [v / factor for v in values]
 
 
 def cleanup_old_history_files():
+    """
+    Remove old history files beyond MAX_HISTORY limit.
+    
+    Keeps the most recent MAX_HISTORY shot graphs, deletes older ones.
+    This prevents unbounded disk usage while maintaining shot history.
+    """
     history_files = sorted(
         OUT_DIR.glob("shot_*.png"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True
+        key=lambda p: p.stat().st_mtime,  # Sort by modification time
+        reverse=True                      # Newest first
     )
+    # Delete files beyond the limit
     for old_file in history_files[MAX_HISTORY:]:
         try:
             old_file.unlink()
@@ -97,9 +212,16 @@ def cleanup_old_history_files():
 
 def cumulative_phase_times(phases):
     """
-    Build phase boundary list from profile phases.
-    For phases with a time stopCondition: use that time.
-    For phases without time, skip them for background shading.
+    Build phase boundary list from profile phases for background shading.
+    
+    Gaggiuino profiles define phases with stopConditions (time-based or event-based).
+    This extracts time-based boundaries for plotting phase backgrounds.
+    
+    Args:
+        phases: List of profile phase dicts from Gaggiuino
+        
+    Returns:
+        List of (cumulative_time, phase_name) tuples for phase boundaries
     """
     boundaries = []
     elapsed = 0.0
@@ -108,16 +230,28 @@ def cumulative_phase_times(phases):
         stop_time = stop.get("time")
         name = phase.get("name", "")
         if stop_time:
+            # Convert milliseconds to seconds
             elapsed += stop_time / 1000.0
             boundaries.append((elapsed, name))
     return boundaries
 
 
 def moving_average(data, window=3):
+    """
+    Compute a simple moving average for smoothing noisy telemetry data.
+    
+    Args:
+        data: List of numeric values
+        window: Window size (default 3 for light smoothing)
+        
+    Returns:
+        List of smoothed values (same length as input)
+    """
     if not data or window <= 1:
         return data[:]
     out = []
     for i in range(len(data)):
+        # Take up to 'window' previous values
         start = max(0, i - window + 1)
         chunk = data[start:i + 1]
         out.append(sum(chunk) / len(chunk))
@@ -125,11 +259,24 @@ def moving_average(data, window=3):
 
 
 def clean_pump_flow(data):
-    """Clip bad startup spikes without affecting the rest of the shot."""
+    """
+    Clip extreme pump flow values during shot startup.
+    
+    Gaggiuino's pump can spike to very high values during initial pressurization
+    before the puck restricts flow. This clips those startup spikes to a
+    reasonable maximum to prevent them from dominating the graph scale.
+    
+    Args:
+        data: List of pump flow values
+        
+    Returns:
+        List with early spikes clipped to 6.0 ml/s
+    """
     if not data:
         return data
 
     cleaned = data[:]
+    # Only clean the first 12 data points (early shot)
     early_points = min(12, len(cleaned))
     for i in range(early_points):
         if cleaned[i] > 6.0:
@@ -139,26 +286,57 @@ def clean_pump_flow(data):
 
 
 def glow_plot(ax, x, y, color, lw=2.0, alpha=1.0, linestyle="-", zorder=3):
+    """
+    Draw a line with a neon glow effect using multiple overlapping lines.
+    
+    Creates depth by drawing the same line multiple times at different:
+    - Linewidths (wider = more spread)
+    - Alphas (lower = more transparent)
+    
+    Args:
+        ax: Matplotlib axes to draw on
+        x, y: Line coordinates
+        color: Line color
+        lw: Core line width
+        alpha: Core opacity
+        linestyle: Line style (default solid)
+        zorder: Drawing order (higher = on top)
+    """
+    # Outer glow (widest, most transparent)
     ax.plot(x, y, color=color, linewidth=lw + 5.5, alpha=0.05, linestyle=linestyle, zorder=zorder - 2)
+    # Middle glow
     ax.plot(x, y, color=color, linewidth=lw + 3.0, alpha=0.09, linestyle=linestyle, zorder=zorder - 1)
+    # Core line (narrowest, most opaque)
     ax.plot(x, y, color=color, linewidth=lw, alpha=alpha, linestyle=linestyle, zorder=zorder)
 
 
 # =========================
-# AI ANALYSIS
+# AI ANALYSIS CONFIG
 # =========================
+# Gemini rate limiting: minimum 70 seconds between calls
+# This prevents hitting Google's per-minute or per-day quotas
 _GEMINI_MIN_INTERVAL = 70
 _GEMINI_LOCK_FILE = OUT_DIR / ".gemini_last_call"
 
+# Severity levels and their display colors
 SEVERITY_COLORS = {
-    "good": "#22c55e",
-    "info": "#60a5fa",
-    "warning": "#facc15",
-    "critical": "#ef4444",
+    "good": "#22c55e",     # Green - positive events
+    "info": "#60a5fa",      # Blue - informational
+    "warning": "#facc15",   # Yellow - caution
+    "critical": "#ef4444",  # Red - problems
 }
 
 
+# =========================
+# GEMINI RATE LIMITING
+# =========================
 def _gemini_get_last_call() -> float:
+    """
+    Get timestamp of last Gemini API call from lock file.
+    
+    Returns:
+        Unix timestamp of last call, or 0.0 if no lock file exists
+    """
     try:
         return float(_GEMINI_LOCK_FILE.read_text().strip())
     except Exception:
@@ -166,6 +344,11 @@ def _gemini_get_last_call() -> float:
 
 
 def _gemini_set_last_call():
+    """
+    Record current timestamp as last Gemini API call time.
+    
+    Creates the lock file if it doesn't exist.
+    """
     try:
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         _GEMINI_LOCK_FILE.write_text(str(time.time()))
@@ -173,18 +356,54 @@ def _gemini_set_last_call():
         print(f"WARNING: Could not write Gemini lock file: {e}")
 
 
+# =========================
+# JSON PARSING
+# =========================
 def _strip_fenced_json(raw: str) -> str:
+    """
+    Remove markdown code fences from LLM response and validate JSON.
+    
+    LLMs often wrap JSON in markdown code blocks (```json ... ```).
+    This extracts the actual JSON content and handles truncated responses.
+    
+    Args:
+        raw: Raw string from LLM (may include fences)
+        
+    Returns:
+        Clean JSON string
+    """
     raw = raw.strip()
+    
+    # Remove opening fence if present
     if raw.startswith("```"):
         parts = raw.split("```")
         if len(parts) >= 2:
             raw = parts[1]
+        # Remove optional "json" language identifier
         if raw.startswith("json"):
             raw = raw[4:]
-    return raw.strip()
+    
+    result = raw.strip()
+    
+    # Validate JSON and handle truncation
+    try:
+        json.loads(result)
+        return result
+    except json.JSONDecodeError:
+        # Try removing trailing characters (response may have been truncated)
+        for skip in range(1, 4):
+            try:
+                candidate = result[:-skip]
+                json.loads(candidate)
+                return candidate
+            except json.JSONDecodeError:
+                continue
+    
+    return result
 
 
 def _normalize_float(value, default=0.0):
+    """Safely convert a value to float, returning default on error."""
     try:
         return float(value)
     except Exception:
@@ -192,24 +411,50 @@ def _normalize_float(value, default=0.0):
 
 
 def _parse_ai_response(raw: str, duration_s: float, events: list, fallback: dict) -> dict:
-    """Parse and validate JSON response from any AI provider."""
+    """
+    Parse and validate JSON response from any AI provider.
+    
+    The LLM returns structured JSON with score, verdict, tuning, and annotations.
+    This function:
+    1. Parses the JSON
+    2. Anchors annotation times to detected events
+    3. Validates and normalizes all fields
+    4. Falls back to defaults if fields are missing
+    
+    Args:
+        raw: Raw JSON string from LLM
+        duration_s: Shot duration for time bounds
+        events: List of detected events from annotation_engine
+        fallback: Default values to use if LLM response is incomplete
+        
+    Returns:
+        Normalized analysis dict with score, verdict, tuning, annotations
+    """
     result = json.loads(_strip_fenced_json(raw))
     valid_severities = set(SEVERITY_COLORS.keys())
+    
+    # Build lookup of detected events by time (for anchoring annotations)
     anchored_events = {round(float(e["time"]), 1): e for e in events}
 
+    # Parse and validate annotations
     clean_annotations = []
-    for ann in result.get("annotations", [])[:5]:
+    for ann in result.get("annotations", [])[:5]:  # Max 5 annotations
+        # Clamp time to shot duration bounds
         ann_time = round(max(0.0, min(duration_s, _normalize_float(ann.get("time"), 0.0))), 1)
+        
+        # Anchor to nearest detected event time
         if anchored_events:
             ann_time = min(anchored_events.keys(), key=lambda t: abs(t - ann_time))
             event = anchored_events[ann_time]
         else:
             event = {"reason": "Detected extraction event.", "type": "event", "severity": "info"}
 
+        # Validate severity level
         severity = ann.get("severity", event.get("severity", "info"))
         if severity not in valid_severities:
             severity = event.get("severity", "info")
 
+        # Truncate label and reason to reasonable lengths
         label = str(ann.get("label", event.get("type", "Event"))).strip()[:48] or "Event"
         reason = str(ann.get("reason", event.get("reason", "Detected extraction event."))).strip()[:180]
 
@@ -221,6 +466,7 @@ def _parse_ai_response(raw: str, duration_s: float, events: list, fallback: dict
             "event_type": event.get("type", "event"),
         })
 
+    # Parse and normalize main analysis fields
     parsed = {
         "score": max(0, min(100, int(result.get("score", fallback.get("score", 0))))),
         "confidence": max(
@@ -239,6 +485,7 @@ def _parse_ai_response(raw: str, duration_s: float, events: list, fallback: dict
         "annotations": clean_annotations if clean_annotations else fallback.get("annotations", []),
     }
 
+    # Fill in missing fields from fallback
     if not parsed["verdict"]:
         parsed["verdict"] = fallback.get("verdict", "")
     if not parsed["tuning"]:
@@ -249,9 +496,24 @@ def _parse_ai_response(raw: str, duration_s: float, events: list, fallback: dict
     return parsed
 
 
+# =========================
+# DATA PREPARATION FOR ANALYSIS
+# =========================
 def _build_series_for_analysis(shot_data: dict) -> dict:
+    """
+    Extract and preprocess telemetry series from shot data.
+    
+    Applies scaling and smoothing to raw Gaggiuino datapoints.
+    
+    Args:
+        shot_data: Full shot data dict from Gaggiuino API
+        
+    Returns:
+        Dict with preprocessed time series arrays
+    """
     dp = shot_data.get("datapoints", {})
-    t = scale_list(dp.get("timeInShot", []), 10.0)
+    t = scale_list(dp.get("timeInShot", []), 10.0)  # Convert to seconds
+    
     return {
         "time_s": t,
         "pressure_bar": moving_average(scale_list(dp.get("pressure", []), 10.0), 2),
@@ -262,11 +524,34 @@ def _build_series_for_analysis(shot_data: dict) -> dict:
     }
 
 
+# =========================
+# FALLBACK ANALYSIS (NO AI)
+# =========================
 def _build_fallback_analysis(features: dict, events: list, heuristic: dict) -> dict:
+    """
+    Build analysis output without LLM - uses deterministic analysis only.
+    
+    This provides a complete analysis even when AI is unavailable:
+    - Maps detected events to human-readable labels
+    - Generates verdict and tuning based on extraction profile
+    - Formats annotations with proper severity levels
+    
+    Args:
+        features: Extracted telemetry features
+        events: Detected extraction events
+        heuristic: Classified extraction tendency and scores
+        
+    Returns:
+        Complete analysis dict without LLM involvement
+    """
+    # Mapping of event types to user-friendly labels
     event_labels = {
         "late_first_drops": "Late first drops",
         "early_first_drops": "Fast opening",
         "first_drops_on_time": "Good first drops",
+        "slow_preinfusion": "Slow pre-infusion",
+        "fast_preinfusion": "Fast pre-infusion",
+        "uneven_preinfusion": "Uneven pre-infusion",
         "high_peak_pressure": "High pressure peak",
         "low_peak_pressure": "Gentle pressure peak",
         "stable_core": "Stable core",
@@ -274,14 +559,20 @@ def _build_fallback_analysis(features: dict, events: list, heuristic: dict) -> d
         "unstable_flow": "Flow wobble",
         "restricted_flow": "Restricted core",
         "fast_core_flow": "Fast core flow",
+        "possible_channeling": "Possible channeling",
         "tail_runaway": "Tail opens up",
         "tail_controlled": "Clean tail",
         "target_hit": "Target hit",
         "stopped_early": "Stopped early",
         "ran_past_target": "Ran long",
+        "poor_profile_adherence": "Profile deviation",
     }
 
-    chosen_events = events[:4]
+    extraction_profile = heuristic.get("extraction_profile", "balanced")
+    taste_profile = heuristic.get("taste_profile", "unknown")
+    
+    # Select top 5 events for annotations
+    chosen_events = events[:5]
     annotations = []
     for event in chosen_events:
         annotations.append({
@@ -294,31 +585,52 @@ def _build_fallback_analysis(features: dict, events: list, heuristic: dict) -> d
 
     tendency = heuristic["tendency"]
     score = heuristic["score_hint"]
-    verdict = (
-        f"Score {score}/100: {features['profile_name']} looks {tendency}, "
-        f"with the main story coming from first drops, core stability, and the tail."
-    )
-
-    tuning = []
-    if any(e["type"] == "late_first_drops" for e in events):
-        tuning.append("Grind slightly coarser or reduce puck resistance a touch to bring first drops earlier.")
-    elif any(e["type"] == "early_first_drops" for e in events):
-        tuning.append("Grind slightly finer to slow the opening and build more body.")
-
-    if any(e["type"] in {"unstable_pressure", "unstable_flow", "tail_runaway"} for e in events):
-        tuning.append("Improve puck prep and stop the shot 1–2g earlier if the tail opens again.")
+    
+    profile_type = features.get("profile_type", "pressure")
+    matched_name = heuristic.get("matched_profile_name", "")
+    adherence_score = heuristic.get("profile_adherence_score", 100)
+    
+    # Build verdict with or without profile match
+    if matched_name:
+        verdict = (
+            f"Score {score}/100: {features['profile_name']} matched '{matched_name}' - "
+            f"{taste_profile.replace('_', ' ')} extraction. {tendency} profile."
+        )
     else:
-        tuning.append("Keep the same overall profile shape and only make small grind adjustments shot to shot.")
+        verdict = (
+            f"Score {score}/100: {features['profile_name']} ({profile_type}) - "
+            f"{taste_profile.replace('_', ' ')} extraction. {tendency} profile."
+        )
 
+    # Generate tuning recommendations based on extraction profile and detected issues
+    tuning = []
+    
+    if any(e["type"] == "poor_profile_adherence" for e in events):
+        tuning.append("Shot deviated from profile - check grind, dose, or profile settings.")
+    
+    if extraction_profile == "fast" or any(e["type"] == "early_first_drops" for e in events):
+        tuning.append("Grind finer to slow the opening and build more body in the shot.")
+    elif extraction_profile in ("slow", "stalling") or any(e["type"] == "late_first_drops" for e in events):
+        tuning.append("Grind coarser or reduce puck resistance to bring first drops earlier.")
+    
+    if any(e["type"] in {"unstable_pressure", "unstable_flow", "tail_runaway"} for e in events):
+        tuning.append("Improve puck prep - uneven extraction detected. Stop 2-3g earlier if tail opens again.")
+    
+    if any(e["type"] == "possible_channeling" for e in events):
+        tuning.append("Channeling suspected - check for clumps, ensure even distribution and tamp.")
+    
+    if extraction_profile == "balanced" and not tuning:
+        tuning.append("Shot looks well-balanced. Make small grind adjustments shot to shot to refine.")
+    
     if any(e["type"] == "stopped_early" for e in events):
         tuning.append("Let the shot run slightly longer to reach the target yield.")
     elif any(e["type"] == "ran_past_target" for e in events):
-        tuning.append("Stop the shot a little earlier to protect sweetness in the tail.")
+        tuning.append("Stop the shot earlier to protect sweetness in the tail.")
 
     tuning = tuning[:3]
     notification_text = verdict
     if tuning:
-        notification_text += " Next shot: " + " ".join(tuning[:2])
+        notification_text += " Tip: " + tuning[0][:80]
 
     return {
         "score": score,
@@ -327,33 +639,87 @@ def _build_fallback_analysis(features: dict, events: list, heuristic: dict) -> d
         "tuning": tuning,
         "notification_text": notification_text[:280],
         "annotations": annotations,
+        "extraction_profile": extraction_profile,
+        "taste_profile": taste_profile,
     }
 
 
+# =========================
+# LLM PROMPT BUILDING
+# =========================
 def _build_llm_prompt(features: dict, events: list, heuristic: dict, fallback: dict) -> str:
+    """
+    Build the prompt for LLM analysis.
+    
+    The prompt instructs the LLM to:
+    1. NOT re-analyze raw data (deterministic engine already did this)
+    2. Only phrase the detected events into user-friendly labels
+    3. Write a verdict and tuning recommendations
+    4. Return structured JSON matching the defined schema
+    
+    This hybrid approach (deterministic analysis + LLM phrasing) is more
+    stable than letting the LLM infer everything from raw data.
+    
+    Args:
+        features: Extracted telemetry features
+        events: Detected extraction events with times and severities
+        heuristic: Classified extraction tendency
+        fallback: Default analysis for reference
+        
+    Returns:
+        Complete prompt string for the LLM
+    """
+    # Compact summary of features and events for the LLM context
     compact = summarize_for_prompt(features, events, heuristic)
-    return f"""You are an expert espresso barista assisting a Home Assistant add-on.
+    extraction_profile = heuristic.get("extraction_profile", "balanced")
+    taste_profile = heuristic.get("taste_profile", "unknown")
+    
+    matched_profile = heuristic.get("matched_profile_name", "")
+    match_type = heuristic.get("profile_match_type", "none")
+    adherence_score = heuristic.get("profile_adherence_score", 100)
+    
+    lang = get_language_config()
+    
+    # Add profile context for better phrasing
+    profile_context = ""
+    if match_type == "name" and matched_profile:
+        profile_context = f"Profile '{matched_profile}' matched by name."
+    elif match_type == "phases" and matched_profile:
+        profile_context = f"Best phase match: '{matched_profile}'."
+    else:
+        profile_context = "No matching profile found. Using generic thresholds."
+    
+    return f"""LANGUAGE REQUIREMENT: {lang["instruction"]}
+
+You are an expert espresso barista assisting a Home Assistant add-on.
 
 This system already ran a deterministic telemetry analyzer. Your job is NOT to rediscover events from raw data. Your job is to:
 - phrase the detected events clearly
 - write a concise overall verdict
-- suggest 2-3 actionable next-shot tweaks
+- suggest 2-3 actionable next-shot tweaks based on the extraction profile
 - return a final score from 0 to 100
 - preserve the provided event times as anchors
 
-Respond with valid JSON only. No markdown. No extra text.
+Key context from deterministic analysis:
+- Profile type: {features.get('profile_type', 'pressure')}
+- {profile_context}
+- Profile adherence score: {adherence_score}/100
+- Extraction profile: {extraction_profile} (balanced/fast/slow/channeling/stalling)
+- Taste profile: {taste_profile} (well_extracted/mostly_balanced/slightly_off/unbalanced/poorly_extracted)
+- Tendency: {heuristic.get('tendency', 'balanced')}
+- Flow ratio: {features.get('avg_flow_ratio', 1.0):.2f} (ideal ~1.0, >1.3 may indicate channeling, <0.7 restriction)
 
 Input JSON:
 {json.dumps(compact, indent=2)}
 
-Return exactly this JSON schema:
+Return exactly this JSON schema (all text must be in {lang["language"]}):
 {{
   "score": <integer 0-100>,
   "confidence": <float 0.0-1.0>,
-  "verdict": "<one sentence overall assessment>",
+  "verdict": "<{lang["verdict_hint"]}>",
   "tuning": [
-    "<actionable recommendation 1>",
-    "<actionable recommendation 2>"
+    "<{lang["tuning_hint"]} 1>",
+    "<{lang["tuning_hint"]} 2>"
   ],
   "annotations": [
     {{
@@ -363,14 +729,19 @@ Return exactly this JSON schema:
       "reason": "<short explanation up to 18 words>"
     }}
   ],
-  "notification_text": "<2 short sentences for mobile push>"
+  "notification_text": "<{lang["notification_hint"]}>"
 }}
 
 Rules:
 - Use only the detected events already provided. Do not invent new times.
 - Keep 3 to 5 annotations total.
 - Keep labels short and readable on a graph.
-- Tuning must be practical for the next shot.
+- IMPORTANT: Never include error messages, system warnings, API errors, or technical debugging text in your response. Only output the JSON. Do not include messages like "ERROR:", "Cannot read", "does not support", "Inform the user", etc.
+- Tuning recommendations must address the specific extraction profile ({extraction_profile}):
+  - For fast/channeling: suggest finer grind, slower pre-infusion, or stopping earlier.
+  - For slow/stalling: suggest coarser grind or reducing puck resistance.
+  - For balanced: suggest only small refinements.
+- If profile adherence is low (<80), suggest checking profile settings.
 - Align the score with the analyzer hints unless there is a strong reason to move it slightly.
 - Score hint: {heuristic['score_hint']}
 - Confidence hint: {heuristic['confidence_hint']}
@@ -378,7 +749,25 @@ Rules:
 """
 
 
+# =========================
+# AI PROVIDERS
+# =========================
 def _analyze_with_anthropic(prompt: str, duration_s: float, events: list, fallback: dict) -> dict:
+    """
+    Call Anthropic Claude API for shot analysis.
+    
+    Uses Claude Haiku for cost efficiency (~$0.001/shot).
+    Falls back to Gemini if this fails.
+    
+    Args:
+        prompt: Complete prompt string
+        duration_s: Shot duration for bounds checking
+        events: Detected events for anchoring
+        fallback: Default analysis
+        
+    Returns:
+        Parsed analysis dict from Claude
+    """
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -388,7 +777,8 @@ def _analyze_with_anthropic(prompt: str, duration_s: float, events: list, fallba
         },
         json={
             "model": os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
-            "max_tokens": 700,
+            # Higher token limit for non-English languages (UTF-8 multi-byte)
+            "max_tokens": 700 if get_language_config().get("language") == "English" else 1500,
             "messages": [{"role": "user", "content": prompt}],
         },
         timeout=30,
@@ -397,12 +787,32 @@ def _analyze_with_anthropic(prompt: str, duration_s: float, events: list, fallba
         logger.warning("Anthropic status=%s body=%s", response.status_code, response.text)
     response.raise_for_status()
     raw = response.json()["content"][0]["text"].strip()
+
     result = _parse_ai_response(raw, duration_s, events, fallback)
     result["provider"] = "anthropic"
     return result
 
 
 def _analyze_with_gemini(prompt: str, duration_s: float, events: list, fallback: dict) -> dict:
+    """
+    Call Google Gemini API for shot analysis.
+    
+    Free tier has rate limits:
+    - Per-minute: limited requests
+    - Per-day: daily quota
+    
+    This function respects rate limits via file-based locking.
+    
+    Args:
+        prompt: Complete prompt string
+        duration_s: Shot duration for bounds checking
+        events: Detected events for anchoring
+        fallback: Default analysis
+        
+    Returns:
+        Parsed analysis dict from Gemini, or empty dict on rate limit
+    """
+    # Rate limiting: wait if necessary
     since_last = time.time() - _gemini_get_last_call()
     if since_last < _GEMINI_MIN_INTERVAL:
         wait = _GEMINI_MIN_INTERVAL - since_last
@@ -415,10 +825,15 @@ def _analyze_with_gemini(prompt: str, duration_s: float, events: list, fallback:
         headers={"Content-Type": "application/json"},
         json={
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 700},
+            "generationConfig": {
+                "temperature": 0.2,  # Lower temp for more consistent JSON
+                "maxOutputTokens": 700 if get_language_config().get("language") == "English" else 1500,
+            },
         },
         timeout=30,
     )
+    
+    # Handle rate limit errors gracefully
     if response.status_code == 429:
         error_body = response.json() if response.content else {}
         error_msg = str(error_body).lower()
@@ -428,6 +843,7 @@ def _analyze_with_gemini(prompt: str, duration_s: float, events: list, fallback:
             print("WARNING: Gemini per-minute rate limit hit - backing off")
         _gemini_set_last_call()
         return {}
+        
     response.raise_for_status()
     raw = response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
     result = _parse_ai_response(raw, duration_s, events, fallback)
@@ -436,25 +852,44 @@ def _analyze_with_gemini(prompt: str, duration_s: float, events: list, fallback:
 
 
 def analyze_shot_with_ai(shot_data: dict) -> dict:
-    """Deterministic analysis always; LLM phrasing when provider exists."""
+    """
+    Main entry point for shot analysis.
+    
+    Runs deterministic analysis first, then attempts AI phrasing if configured.
+    Always returns a complete analysis - falls back to deterministic-only if AI fails.
+    
+    Args:
+        shot_data: Full shot data from Gaggiuino API
+        
+    Returns:
+        Complete analysis with score, verdict, tuning, and annotations
+    """
+    # Step 1: Deterministic analysis (always runs)
     series = _build_series_for_analysis(shot_data)
     features = extract_features(shot_data, series)
     events = detect_events(features)
     heuristic = classify_extraction_tendency(features, events)
+    
+    features["taste_profile"] = heuristic.get("taste_profile", "")
+    features["extraction_profile"] = heuristic.get("extraction_profile", "")
+    
+    # Build fallback analysis (no AI)
     fallback = _build_fallback_analysis(features, events, heuristic)
-
     fallback["provider"] = "deterministic"
     fallback["features"] = features
     fallback["detected_events"] = events
     fallback["heuristic"] = heuristic
 
+    # Step 2: Check if AI is configured
     if not ANTHROPIC_API_KEY and not GEMINI_API_KEY:
         print("AI provider not configured - using deterministic analysis")
         return fallback
 
+    # Step 3: Build prompt for LLM
     prompt = _build_llm_prompt(features, events, heuristic, fallback)
     result = {}
 
+    # Step 4: Try Anthropic first (primary)
     if ANTHROPIC_API_KEY:
         try:
             print("AI phrasing via Anthropic Claude...")
@@ -464,6 +899,7 @@ def analyze_shot_with_ai(shot_data: dict) -> dict:
             print(f"WARNING: Anthropic analysis failed: {e} - falling back to Gemini")
             result = {}
 
+    # Step 5: Try Gemini if Anthropic failed (fallback)
     if not result and GEMINI_API_KEY:
         try:
             print("AI phrasing via Gemini...")
@@ -474,6 +910,7 @@ def analyze_shot_with_ai(shot_data: dict) -> dict:
             print(f"WARNING: Gemini analysis failed: {e}")
             result = {}
 
+    # Step 6: Return AI result or fallback
     if not result:
         return fallback
 
@@ -483,8 +920,23 @@ def analyze_shot_with_ai(shot_data: dict) -> dict:
     return result
 
 
+# =========================
+# GRAPH DRAWING
+# =========================
 def _draw_score_stamp(ax, analysis: dict):
-    """Draw a stable faux rubber-stamp score in the top-left corner."""
+    """
+    Draw a diagonal rubber-stamp style score overlay in the top-left corner.
+    
+    Color coded:
+    - Green: 80+ (excellent)
+    - Yellow-green: 70-79 (good)
+    - Orange: 60-69 (drinkable)
+    - Red: <60 (problematic)
+    
+    Args:
+        ax: Matplotlib axes to draw on
+        analysis: Analysis dict with score field
+    """
     if not analysis:
         return
 
@@ -497,90 +949,75 @@ def _draw_score_stamp(ax, analysis: dict):
     except Exception:
         return
 
-    stamp_text = f"SHOT {score_int}/100"
+    stamp_text = f"SCORE {score_int}/100"
 
-    if score_int >= 85:
-        color = "#39FF14"
+    # Color based on score range
+    if score_int >= 80:
+        color = "#39FF14"   # Neon green
     elif score_int >= 70:
-        color = "#CFFF04"
-    elif score_int >= 55:
-        color = "#FFB000"
+        color = "#CFFF04"   # Yellow-green
+    elif score_int >= 60:
+        color = "#FFB000"   # Orange
     else:
-        color = "#FF3131"
+        color = "#FF3131"   # Red
 
+    # Position in top-left with slight rotation
     x = 0.05
     y = 0.76
     rotation = 22
 
+    # Draw three layers for depth effect
+    # Outer glow
     ax.text(
-        x,
-        y,
-        stamp_text,
+        x, y, stamp_text,
         transform=ax.transAxes,
-        ha="left",
-        va="top",
-        rotation=rotation,
-        rotation_mode="anchor",
-        fontsize=24,
-        fontweight="bold",
-        color=color,
-        alpha=0.22,
-        zorder=58,
-        clip_on=False,
-        bbox=dict(
-            boxstyle="square,pad=0.30",
-            facecolor="none",
-            edgecolor=color,
-            linewidth=4.8,
-        ),
+        ha="left", va="top",
+        rotation=rotation, rotation_mode="anchor",
+        fontsize=24, fontweight="bold",
+        color=color, alpha=0.22,
+        zorder=58, clip_on=False,
+        bbox=dict(boxstyle="square,pad=0.30", facecolor="none", edgecolor=color, linewidth=4.8),
     )
-
+    # Inner glow
     ax.text(
-        x,
-        y,
-        stamp_text,
+        x, y, stamp_text,
         transform=ax.transAxes,
-        ha="left",
-        va="top",
-        rotation=rotation,
-        rotation_mode="anchor",
-        fontsize=24,
-        fontweight="bold",
-        color=color,
-        alpha=0.96,
-        zorder=59,
-        clip_on=False,
-        bbox=dict(
-            boxstyle="square,pad=0.20",
-            facecolor="none",
-            edgecolor=color,
-            linewidth=2.4,
-        ),
+        ha="left", va="top",
+        rotation=rotation, rotation_mode="anchor",
+        fontsize=24, fontweight="bold",
+        color=color, alpha=0.96,
+        zorder=59, clip_on=False,
+        bbox=dict(boxstyle="square,pad=0.20", facecolor="none", edgecolor=color, linewidth=2.4),
     )
-
+    # Core shadow
     ax.text(
-        x - 0.0015,
-        y + 0.0015,
-        stamp_text,
+        x - 0.0015, y + 0.0015, stamp_text,
         transform=ax.transAxes,
-        ha="left",
-        va="top",
-        rotation=rotation,
-        rotation_mode="anchor",
-        fontsize=24,
-        fontweight="bold",
-        color=color,
-        alpha=0.06,
-        zorder=57,
-        clip_on=False,
+        ha="left", va="top",
+        rotation=rotation, rotation_mode="anchor",
+        fontsize=24, fontweight="bold",
+        color=color, alpha=0.06,
+        zorder=57, clip_on=False,
     )
 
 
-# =========================
-# GRAPH ANNOTATIONS OVERLAY
-# =========================
 def draw_annotations(ax_press, ax_temp, t, pressure, pump_flow, annotations: list):
-    """Draw timestamped annotation arrows on the chart."""
+    """
+    Draw timestamped annotation arrows on the chart.
+    
+    Each annotation is drawn at the detected event time with:
+    - Arrow pointing from data to label
+    - Severity-based coloring
+    - Smart Y-position stacking to avoid overlap
+    
+    Args:
+        ax_press: Pressure axes (for arrow endpoints)
+        ax_temp: Temperature axes (for arrow endpoints)
+        t: Time series array
+        pressure: Pressure array (for Y positioning)
+        pump_flow: Pump flow array (unused but kept for signature)
+        annotations: List of annotation dicts with time, label, severity
+    """
     if not annotations or not t:
         return
 
@@ -593,12 +1030,14 @@ def draw_annotations(ax_press, ax_temp, t, pressure, pump_flow, annotations: lis
         severity = ann.get("severity", "info")
         color = SEVERITY_COLORS.get(severity, SEVERITY_COLORS["info"])
 
+        # Find Y position at annotation time
         if t:
             idx = min(range(len(t)), key=lambda i: abs(t[i] - ann_t))
             y_data = pressure[idx] if idx < len(pressure) else press_max * 0.5
         else:
             y_data = press_max * 0.5
 
+        # Calculate label position with stacking to avoid overlap
         base_y = min(y_data + 1.5, press_max * 0.88)
         for used_y in used_y_positions:
             if abs(base_y - used_y) < 0.9:
@@ -606,11 +1045,12 @@ def draw_annotations(ax_press, ax_temp, t, pressure, pump_flow, annotations: lis
         base_y = min(base_y, press_max * 0.92)
         used_y_positions.append(base_y)
 
+        # Draw annotation arrow and label
         ax_press.annotate(
             label,
             xy=(ann_t, y_data),
             xytext=(ann_t, base_y),
-            fontsize=12,  #fontsize=7.5,
+            fontsize=12,
             color=color,
             ha="center",
             va="bottom",
@@ -632,22 +1072,31 @@ def draw_annotations(ax_press, ax_temp, t, pressure, pump_flow, annotations: lis
 
 
 def _score_color(score) -> str:
+    """Get the color associated with a score value."""
     try:
         score_int = int(round(float(score)))
     except Exception:
         return TEXT_LIGHT
 
-    if score_int >= 85:
+    if score_int >= 80:
         return "#39FF14"
     if score_int >= 70:
         return "#CFFF04"
-    if score_int >= 55:
+    if score_int >= 60:
         return "#FFB000"
     return "#FF3131"
 
 
 def draw_verdict_panel(fig, analysis: dict):
-    """Top-left verdict panel."""
+    """
+    Draw the AI verdict text panel in the top-left area.
+    
+    Shows the overall assessment from AI analysis.
+    
+    Args:
+        fig: Matplotlib figure
+        analysis: Analysis dict with verdict field
+    """
     if not analysis:
         return
 
@@ -662,11 +1111,9 @@ def draw_verdict_panel(fig, analysis: dict):
     panel_text = textwrap.fill(verdict, width=140)
 
     fig.text(
-        0.066,
-        0.875,
+        0.066, 0.875,
         panel_text,
-        ha="left",
-        va="bottom",
+        ha="left", va="bottom",
         fontsize=12,
         color=color,
         zorder=10,
@@ -682,7 +1129,15 @@ def draw_verdict_panel(fig, analysis: dict):
 
 
 def draw_tuning_panel(fig, analysis: dict):
-    """Bottom-right tuning panel."""
+    """
+    Draw the tuning recommendations panel in the bottom-left area.
+    
+    Shows the first tuning tip from AI analysis.
+    
+    Args:
+        fig: Matplotlib figure
+        analysis: Analysis dict with tuning field
+    """
     if not analysis:
         return
 
@@ -696,17 +1151,14 @@ def draw_tuning_panel(fig, analysis: dict):
     color = _score_color(score)
 
     wrapped_lines = []
-    for tip in tuning[:1]:
-    # for tip in tuning[0]:    
-        wrapped_lines.append("★ " + textwrap.fill(tip, width=140)) #52
+    for tip in tuning[:1]:  # Show only first tip on graph
+        wrapped_lines.append("★ " + textwrap.fill(tip, width=140))
     panel_text = "\n".join(wrapped_lines)
 
     fig.text(
-        0.066, #0.62,
-        0.064,
+        0.066, 0.064,
         panel_text,
-        ha="left",
-        va="bottom",
+        ha="left", va="bottom",
         fontsize=12,
         color=color,
         zorder=10,
@@ -721,9 +1173,24 @@ def draw_tuning_panel(fig, analysis: dict):
     )
 
 
+# =========================
+# JSON DATA OUTPUT
+# =========================
 def write_shot_json(summary: dict, analysis: dict):
-    """Write full shot data + analysis to last_shot.json and shot_history.json."""
+    """
+    Write shot data and analysis to JSON files.
+    
+    Creates two files:
+    - last_shot.json: Full data for the most recent shot
+    - shot_history.json: Array of last 10 shots
+    
+    Args:
+        summary: Shot metadata (shot_id, profile, duration, weight, etc.)
+        analysis: Analysis results (score, verdict, tuning, features, events)
+    """
     try:
+        features = analysis.get("features", {}) if analysis else {}
+        
         shot_json = {
             "datetime": datetime.now().strftime("%d/%m/%Y-%H:%M:%S"),
             "shot_id": summary.get("shot_id"),
@@ -742,37 +1209,60 @@ def write_shot_json(summary: dict, analysis: dict):
             "tuning": analysis.get("tuning", []) if analysis else [],
             "notification_text": analysis.get("notification_text", "") if analysis else "",
             "annotations": analysis.get("annotations", []) if analysis else [],
-            "features": analysis.get("features", {}) if analysis else {},
+            "features": features,
             "detected_events": analysis.get("detected_events", []) if analysis else [],
+            "profile_match_type": features.get("profile_match_type", "none"),
+            "profile_match_confidence": features.get("profile_match_confidence", 0.0),
+            "matched_profile_name": features.get("matched_profile_name", ""),
+            "profile_adherence_score": features.get("profile_adherence_score", 100),
+            "taste_profile": features.get("taste_profile", ""),
+            "extraction_profile": features.get("extraction_profile", ""),
         }
 
+        # Write last_shot.json
         json_file = OUT_DIR / "last_shot.json"
         json_file.write_text(json.dumps(shot_json, indent=2))
         print(f"Shot JSON written to {json_file}")
 
+        # Update shot_history.json
         history_file = OUT_DIR / "shot_history.json"
         try:
             history = json.loads(history_file.read_text()) if history_file.exists() else []
         except Exception:
             history = []
 
+        # Replace existing entry for this shot, insert at front, keep last 5
         history = [s for s in history if s.get("shot_id") != shot_json["shot_id"]]
         history.insert(0, shot_json)
-        history = history[:5]
+        history = history[:10]
         history_file.write_text(json.dumps(history, indent=2))
         print(f"Shot history updated ({len(history)} shots)")
 
     except Exception as e:
         print(f"WARNING: Could not write shot JSON: {e}")
 
+
 # =========================
-# MAIN
+# MAIN EXECUTION
 # =========================
 def main():
+    """
+    Main entry point for shot graph generation.
+    
+    This is called when the script is run directly (as a subprocess from server.py).
+    It fetches shot data, generates the graph, runs AI analysis, and writes output files.
+    
+    Output:
+    - /homeassistant/www/gaggiuino-barista/last_shot.png (always updated)
+    - /homeassistant/www/gaggiuino-barista/shot_YYYY-MM-DD_HH-MM-SS_id{N}.png (timestamped)
+    - /homeassistant/www/gaggiuino-barista/last_shot.json
+    - /homeassistant/www/gaggiuino-barista/shot_history.json
+    - Prints "SUMMARY:" + JSON to stdout for parent process
+    """
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Fetch latest shot ID
     latest = get_json(f"{API_BASE}/api/shots/latest")
-
     if isinstance(latest, list) and latest:
         latest_item = latest[0]
     elif isinstance(latest, dict):
@@ -784,43 +1274,33 @@ def main():
     if shot_id is None:
         raise RuntimeError(f"Could not find shot id in response: {latest}")
 
-    timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    history_file = OUT_DIR / f"shot_{timestamp_str}_id{shot_id}.png"
-
+    # Fetch complete shot data
     shot = get_json(f"{API_BASE}/api/shots/{shot_id}")
     dp = shot["datapoints"]
 
-    # ---------- raw data ----------
-    t = scale_list(dp["timeInShot"], 10.0)
-
+    # --- Extract and scale raw data ---
+    t = scale_list(dp["timeInShot"], 10.0)  # Convert to seconds
     pressure = scale_list(dp["pressure"], 10.0)
     target_pressure = scale_list(dp["targetPressure"], 10.0)
-
     pump_flow = scale_list(dp["pumpFlow"], 10.0)
     target_pump_flow = scale_list(dp["targetPumpFlow"], 10.0)
-
     temp = scale_list(dp["temperature"], 10.0)
     target_temp = scale_list(dp["targetTemperature"], 10.0)
-
     shot_weight = scale_list(dp["shotWeight"], 10.0)
     raw_weight_flow = scale_list(dp.get("weightFlow", [0] * len(t)), 10.0)
 
-    # ---------- cleanup / smoothing ----------
+    # --- Apply smoothing ---
     pressure = moving_average(pressure, 2)
     target_pressure = moving_average(target_pressure, 2)
-
-    pump_flow = clean_pump_flow(pump_flow)
+    pump_flow = clean_pump_flow(pump_flow)  # Clip startup spikes
     pump_flow = moving_average(pump_flow, 3)
     target_pump_flow = moving_average(target_pump_flow, 2)
-
     weight_flow = moving_average(raw_weight_flow, 3)
-
     temp = moving_average(temp, 2)
     target_temp = moving_average(target_temp, 2)
-
     shot_weight = moving_average(shot_weight, 2)
 
-    # ---------- metadata ----------
+    # --- Extract metadata ---
     profile = shot.get("profile", {})
     phases = profile.get("phases", [])
     phase_boundaries = cumulative_phase_times(phases)
@@ -834,18 +1314,20 @@ def main():
     water_temp = profile.get("waterTemperature", "-")
 
     # =========================
-    # FIGURE / AXES
+    # CREATE FIGURE
     # =========================
     fig = plt.figure(figsize=(16, 9), facecolor=DARK_BG)
 
-    ax_temp = fig.add_subplot(111)
-    ax_press = ax_temp.twinx()
-    ax_grams = ax_temp.twinx()
+    # Create axes with shared X axis
+    ax_temp = fig.add_subplot(111)      # Temperature (left Y axis)
+    ax_press = ax_temp.twinx()          # Pressure/Flow (right Y axis)
+    ax_grams = ax_temp.twinx()          # Weight (hidden right Y axis)
 
     fig.patch.set_facecolor(DARK_BG)
     for ax in (ax_temp, ax_press, ax_grams):
         ax.set_facecolor(DARK_BG)
 
+    # Hide the extra Y axis used for shot weight
     for spine in ax_grams.spines.values():
         spine.set_visible(False)
     ax_grams.set_yticks([])
@@ -866,9 +1348,7 @@ def main():
     )
 
     header_bar = plt.Rectangle(
-        (0.01, 0.94),
-        0.98,
-        0.06,
+        (0.01, 0.94), 0.98, 0.06,
         transform=fig.transFigure,
         facecolor=HEADER_BG,
         edgecolor="#1f2d45",
@@ -880,8 +1360,7 @@ def main():
     fig.text(
         0.5, 0.97,
         header_text,
-        ha="center",
-        va="center",
+        ha="center", va="center",
         fontsize=11,
         color=TEXT_LIGHT,
         zorder=3
@@ -890,26 +1369,23 @@ def main():
     # =========================
     # PHASE BACKGROUNDS
     # =========================
+    # Alternating colors for phase differentiation
     phase_colors = [
-        "#0e1a2f",
-        "#0b1629",
-        "#101d33",
-        "#0c1a30",
-        "#0a172a",
-        "#0f1c31",
+        "#0e1a2f", "#0b1629", "#101d33",
+        "#0c1a30", "#0a172a", "#0f1c31",
     ]
 
     start_x = 0.0
     for idx, (end_x, _name) in enumerate(phase_boundaries):
         ax_temp.axvspan(
-            start_x,
-            end_x,
+            start_x, end_x,
             color=phase_colors[idx % len(phase_colors)],
             alpha=0.18,
             linewidth=0,
         )
         start_x = end_x
 
+    # Define phase boundaries for manual detection (when profile not available)
     PREINFUSION_KEYWORDS = {
         "wetting", "wet", "quick wet", "bloom", "pre-infusion", "preinfusion",
         "pre infusion", "compression", "compress", "puck compression",
@@ -918,8 +1394,9 @@ def main():
 
     total_t = max(t) if t else 30
     split1 = 0.0
-    split2 = total_t * 0.80
+    split2 = total_t * 0.80  # Default: 80% of shot is main extraction
 
+    # Use profile phase boundaries if available
     if phase_boundaries:
         named = [(xv, n) for xv, n in phase_boundaries if n.strip()]
         if named:
@@ -934,18 +1411,17 @@ def main():
     if split2 <= split1 + 2:
         split2 = split1 + (total_t - split1) * 0.65
 
+    # Draw phase dividers and labels
     def draw_divider(xv):
         ax_temp.axvline(xv, linestyle="--", linewidth=1.2, alpha=0.45, color="#7c8ea8", zorder=5)
 
     def draw_stage_label(x_start, x_end, label):
         ax_temp.text(
-            (x_start + x_end) / 2.0,
-            86.5,
+            (x_start + x_end) / 2.0, 86.5,
             label,
             color=TEXT_DIM,
             fontsize=8,
-            ha="center",
-            va="center",
+            ha="center", va="center",
             alpha=0.95,
         )
 
@@ -965,22 +1441,28 @@ def main():
         draw_stage_label(split2, total_t, "Final Phase")
 
     # =========================
-    # PLOTS
+    # PLOT CURVES WITH GLOW EFFECT
     # =========================
+    # Temperature (with target)
     glow_plot(ax_temp, t, temp, COLOR_TEMP, lw=1.8, zorder=5)
     glow_plot(ax_temp, t, target_temp, COLOR_TEMP_TARGET, lw=1.4, linestyle=(0, (4, 3)), alpha=0.7, zorder=4)
 
+    # Pressure (with target)
     glow_plot(ax_press, t, pressure, COLOR_PRESSURE, lw=2.8, zorder=8)
     glow_plot(ax_press, t, target_pressure, COLOR_PRESSURE_TARGET, lw=1.8, linestyle=(0, (4, 3)), alpha=0.7, zorder=7)
 
+    # Pump flow (with target)
     glow_plot(ax_press, t, pump_flow, COLOR_FLOW, lw=2.2, zorder=6)
     glow_plot(ax_press, t, target_pump_flow, COLOR_FLOW_TARGET, lw=1.5, linestyle=(0, (4, 3)), alpha=0.7, zorder=5)
 
+    # Weight flow rate
     glow_plot(ax_press, t, weight_flow, COLOR_WEIGHT_FLOW, lw=2.0, zorder=5)
+
+    # Shot weight accumulation
     glow_plot(ax_grams, t, shot_weight, COLOR_WEIGHT, lw=2.6, zorder=6)
 
     # =========================
-    # LIMITS / AXES
+    # AXIS CONFIGURATION
     # =========================
     ax_temp.set_xlim(left=0, right=max(t) if t else 30)
     ax_temp.set_ylim(0, 100)
@@ -1012,13 +1494,10 @@ def main():
     if t:
         ax_temp.axvline(t[-1], linestyle=":", linewidth=1.1, alpha=0.35, color="#90a4c0")
         ax_grams.text(
-            t[-1] - 0.98,
-            final_weight,
+            t[-1] - 0.98, final_weight,
             f"{final_weight:.1f}gr",
-            ha="right",
-            va="center",
-            fontsize=10,
-            color=TEXT_BOX,
+            ha="right", va="center",
+            fontsize=10, color=TEXT_BOX,
             bbox=dict(
                 facecolor="#111827",
                 edgecolor=SPINE_COLOR,
@@ -1055,7 +1534,7 @@ def main():
     plt.tight_layout(rect=[0.015, 0.08, 0.985, 0.92])
 
     # =========================
-    # SAVE GRAPH (without AI first)
+    # SAVE INITIAL GRAPH (without AI)
     # =========================
     def save_figure():
         fig.savefig(
@@ -1070,19 +1549,24 @@ def main():
     print("Graph saved (no AI overlay yet)")
 
     # =========================
-    # AI ANALYSIS + OVERLAY
+    # RUN AI ANALYSIS AND OVERLAY
     # =========================
     analysis = analyze_shot_with_ai(shot)
 
     if analysis:
+        # Add AI panels
         draw_verdict_panel(fig, analysis)
         draw_tuning_panel(fig, analysis)
 
+        # Add annotations
         annotations = analysis.get("annotations", [])
         if annotations:
             draw_annotations(ax_press, ax_temp, t, pressure, pump_flow, annotations)
 
+        # Add score stamp
         _draw_score_stamp(ax_temp, analysis)
+        
+        # Save with AI overlays
         save_figure()
         print("Graph re-saved with AI annotations")
     else:
@@ -1090,16 +1574,22 @@ def main():
 
     plt.close(fig)
 
+    # Verify graph was created
     if not LAST_FILE.exists():
         raise RuntimeError(f"Chart was not created: {LAST_FILE}")
 
+    # Copy to timestamped history file
+    timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    history_file = OUT_DIR / f"shot_{timestamp_str}_id{shot_id}.png"
     shutil.copy2(LAST_FILE, history_file)
 
     if not history_file.exists():
         raise RuntimeError(f"History chart was not created: {history_file}")
 
+    # Clean up old history files
     cleanup_old_history_files()
 
+    # Build summary for output
     summary = {
         "ok": True,
         "shot_id": shot_id,
@@ -1121,8 +1611,17 @@ def main():
         summary["verdict"] = analysis.get("verdict", "")
         summary["tuning"] = analysis.get("tuning", [])
         summary["notification_text"] = analysis.get("notification_text", "")
+        
+        features = analysis.get("features", {})
+        summary["profile_match_type"] = features.get("profile_match_type", "none")
+        summary["profile_match_confidence"] = features.get("profile_match_confidence", 0.0)
+        summary["matched_profile_name"] = features.get("matched_profile_name", "")
+        summary["profile_adherence_score"] = features.get("profile_adherence_score", 100)
 
+    # Write JSON files
     write_shot_json(summary, analysis)
+    
+    # Print summary for parent process
     print("SUMMARY:" + json.dumps(summary))
 
 
