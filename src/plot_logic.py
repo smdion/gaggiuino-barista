@@ -1261,18 +1261,22 @@ def main():
     """
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Fetch latest shot ID
-    latest = get_json(f"{API_BASE}/api/shots/latest")
-    if isinstance(latest, list) and latest:
-        latest_item = latest[0]
-    elif isinstance(latest, dict):
-        latest_item = latest
+    # Use SHOT_ID env var if set (for batch/specific shot analysis), else fetch latest
+    shot_id = os.getenv("SHOT_ID")
+    if shot_id:
+        shot_id = int(shot_id)
     else:
-        raise RuntimeError(f"Unexpected response from /api/shots/latest: {latest}")
+        latest = get_json(f"{API_BASE}/api/shots/latest")
+        if isinstance(latest, list) and latest:
+            latest_item = latest[0]
+        elif isinstance(latest, dict):
+            latest_item = latest
+        else:
+            raise RuntimeError(f"Unexpected response from /api/shots/latest: {latest}")
 
-    shot_id = latest_item.get("lastShotId") or latest_item.get("id")
-    if shot_id is None:
-        raise RuntimeError(f"Could not find shot id in response: {latest}")
+        shot_id = latest_item.get("lastShotId") or latest_item.get("id")
+        if shot_id is None:
+            raise RuntimeError(f"Could not find shot id in response: {latest}")
 
     # Fetch complete shot data
     shot = get_json(f"{API_BASE}/api/shots/{shot_id}")
