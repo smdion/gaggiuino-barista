@@ -133,25 +133,22 @@ jobs:
           BRANCH="${{ steps.merge.outputs.branch }}"
           git push origin "$BRANCH" --force
 
+          # Ensure upstream-update label exists
+          gh label create "upstream-update" --color "0E8A16" --description "Automated upstream sync" 2>/dev/null || true
+
           # Close any existing upstream-update PRs
           EXISTING_PR=$(gh pr list --label "upstream-update" --state open --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING_PR" ]; then
             gh pr close "$EXISTING_PR" --comment "Superseded by new upstream sync."
           fi
 
-          # Close any existing upstream-update issues
-          EXISTING_ISSUE=$(gh issue list --label "upstream-update" --state open --json number --jq '.[0].number // empty')
-          if [ -n "$EXISTING_ISSUE" ]; then
-            gh issue close "$EXISTING_ISSUE" --comment "Superseded — PR created with clean merge."
-          fi
-
           gh pr create \
             --base main \
             --head "$BRANCH" \
             --title "Upstream sync (${UPSTREAM_SHA:0:8}) — builds OK" \
-            --body "$(cat <<'PREOF'
+            --body "$(cat <<PREOF
           ## Summary
-          - Synced with upstream [nikosiaf/gaggiuino-barista](https://github.com/nikosiaf/gaggiuino-barista) at `UPSTREAM_SHA_PLACEHOLDER`
+          - Synced with upstream [nikosiaf/gaggiuino-barista](https://github.com/nikosiaf/gaggiuino-barista) at \`${UPSTREAM_SHA}\`
           - Merge: clean (no conflicts)
           - Python lint: passed
           - Docker build (standalone): passed
@@ -167,51 +164,23 @@ jobs:
           )" \
             --label "upstream-update"
 
-          # Fix the placeholder in the PR body
-          PR_NUM=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number')
-          gh pr edit "$PR_NUM" --body "$(gh pr view "$PR_NUM" --json body --jq '.body' | sed "s/UPSTREAM_SHA_PLACEHOLDER/${UPSTREAM_SHA}/")"
-
   notify-failure:
-    name: Create issue (upstream incompatible)
+    name: Notify upstream sync failure
     runs-on: ubuntu-latest
     needs: [check-upstream, test-upstream-compat]
     if: always() && needs.check-upstream.outputs.has_updates == 'true' && needs.test-upstream-compat.result == 'failure'
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Create failure issue
+      - name: Annotate workflow run with failure details
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM_SHA: ${{ needs.check-upstream.outputs.upstream_sha }}
           CONFLICT_FILES: ${{ needs.test-upstream-compat.outputs.conflict_files }}
           MERGE_OK: ${{ needs.test-upstream-compat.outputs.merge_ok }}
         run: |
-          # Close any existing upstream-update issues
-          EXISTING=$(gh issue list --label "upstream-update" --state open --json number --jq '.[0].number // empty')
-          if [ -n "$EXISTING" ]; then
-            gh issue close "$EXISTING" --comment "Superseded by new upstream check."
-          fi
-
           if [ "$MERGE_OK" = "false" ]; then
-            DETAIL="**Merge conflicts** in: \`${CONFLICT_FILES}\`
-
-          The upstream changes conflict with fork customizations. Manual resolution required."
+            echo "::error::Upstream sync failed — merge conflicts in: ${CONFLICT_FILES}. Manual resolution required. Upstream HEAD: ${UPSTREAM_SHA}"
           else
-            DETAIL="Merge was clean but **build or verification failed**.
-
-          Fork customizations may need updating for upstream compatibility."
+            echo "::error::Upstream sync failed — merge was clean but build or verification failed. Fork customizations may need updating. Upstream HEAD: ${UPSTREAM_SHA}"
           fi
-
-          gh issue create \
-            --title "⚠️ Upstream sync failed (${UPSTREAM_SHA:0:8}) — needs manual fix" \
-            --body "New commits on [nikosiaf/gaggiuino-barista](https://github.com/nikosiaf/gaggiuino-barista) are incompatible with fork.
-
-          Upstream HEAD: \`${UPSTREAM_SHA}\`
-
-          ${DETAIL}
-
-          [View CI run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
-            --label "upstream-update"
 
   build:
     name: Build Docker images
