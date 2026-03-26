@@ -167,11 +167,16 @@ jobs:
           )
 
           # Use REST API — GraphQL createPullRequest is blocked on forks
-          gh api repos/${{ github.repository }}/pulls \
+          PR_URL=$(gh api repos/${{ github.repository }}/pulls \
             -f title="Upstream sync (${UPSTREAM_SHA:0:8}) — builds OK" \
             -f head="$BRANCH" \
             -f base="main" \
-            -f body="$PR_BODY"
+            -f body="$PR_BODY" \
+            --jq '.number')
+
+          # Request review so the repo owner gets a notification
+          gh api repos/${{ github.repository }}/pulls/${PR_URL}/requested_reviewers \
+            -f "reviewers[]=smdion"
 
   notify-failure:
     name: Notify upstream sync failure
