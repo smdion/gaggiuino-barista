@@ -1,0 +1,112 @@
+# ============================================================
+# Shot Selector Card v2.0.0
+# Dropdown to select from last 10 shots with details & graph
+# ============================================================
+#
+# SETUP STEPS:
+#
+# 1. Create an Input Select Helper in HA:
+#    Go to Settings → Devices & Services → Helpers → Add Helper → Dropdown
+#    Name: Shot History Selector
+#    Icon: mdi:coffee
+#    Options (copy all these on one line, comma-separated):
+#    Shot 1,Shot 2,Shot 3,Shot 4,Shot 5,Shot 6,Shot 7,Shot 8,Shot 9,Shot 10
+#
+# 2. Add the Dashboard Card below to your HA Dashboard
+#    (Dashboard → Edit → Add Card → Manual)
+#
+# 3. Automations (optional - see below for auto-update)
+#
+# ============================================================
+
+
+# ── AUTOMATION: Auto-update dropdown when new shot is pulled ───────────────
+# Add this to your automations.yaml:
+#
+# alias: "Update Shot History Selector"
+# trigger:
+#   - platform: state
+#     entity_id: sensor.gaggiuino_barista_shot_history
+# action:
+#   - service: input_select.set_options
+#     target:
+#       entity_id: input_select.shot_history_selector
+#     data:
+#       options: >-
+#         {% set shots = state_attr('sensor.gaggiuino_barista_shot_history', 'shots') or [] %}
+#         {{ ['Shot 1', 'Shot 2', 'Shot 3', 'Shot 4', 'Shot 5', 'Shot 6', 'Shot 7', 'Shot 8', 'Shot 9', 'Shot 10'][:shots|length] | tojson }}
+#   - service: input_select.select_option
+#     target:
+#       entity_id: input_select.shot_history_selector
+#     data:
+#       option: "Shot 1"
+
+
+# ── Dashboard Card ────────────────────────────────────────────────────────
+# Copy from here to the end of the file into your dashboard
+type: vertical-stack
+cards:
+  # Dropdown selector
+  - type: entities
+    entities:
+      - entity: input_select.shot_history_selector
+        name: Select Shot
+    title: ☕ Shot History
+    style: |
+      ha-card { border-radius: 12px; margin-bottom: 8px; }
+
+  # Selected shot details
+  - type: custom:config-template-card
+    entities:
+      - input_select.shot_history_selector
+      - sensor.gaggiuino_barista_shot_history
+    card:
+      type: markdown
+      content: >-
+        ${(() => {
+          const sel = states['input_select.shot_history_selector'].state;
+          const idx = parseInt(sel.replace('Shot ', '')) - 1;
+          const shots = states['sensor.gaggiuino_barista_shot_history'].attributes.shots;
+          if (!shots || idx < 0 || idx >= shots.length) return '*No shot data*';
+          const s = shots[idx];
+          const sc = s.score ? '📊 **Score: ' + s.score + '/100**' : '';
+          const ai = s.ai_available ? '🧠 AI Analysis: ' + (s.verdict || 'N/A') : '';
+          const tips = s.tuning && s.tuning.length ? s.tuning[0] : '';
+          return '**' + s.datetime + '**  ☕ ' + s.profile + '\n\n' +
+                 '⏱ ' + s.duration_s + 's  ⚖️ ' + s.final_weight_g + 'g  📈 ' + s.max_pressure_bar + 'bar  🌡 ' + s.water_temp_c + '°C' +
+                 (sc ? '\n\n' + sc : '') +
+                 (ai ? '\n\n' + ai : '') +
+                 (tips ? '\n\n🔧 ' + tips : '');
+        })()}
+      card_mod:
+        style: |
+          ha-card { border-radius: 12px; margin-bottom: 8px; padding: 16px; }
+
+  # Graph for selected shot
+  - type: custom:config-template-card
+    entities:
+      - input_select.shot_history_selector
+      - sensor.gaggiuino_barista_shot_history
+    card:
+      type: picture
+      image: >-
+        ${(() => {
+          const sel = states['input_select.shot_history_selector'].state;
+          const idx = parseInt(sel.replace('Shot ', ''));
+          const graphs = states['sensor.gaggiuino_barista_shot_history'].attributes.graphs;
+          if (!graphs || idx < 1 || idx > graphs.length) return '';
+          return graphs[idx - 1].url;
+        })()}
+      tap_action:
+        action: url
+        url_path: >-
+          ${(() => {
+            const sel = states['input_select.shot_history_selector'].state;
+            const idx = parseInt(sel.replace('Shot ', ''));
+            const graphs = states['sensor.gaggiuino_barista_shot_history'].attributes.graphs;
+            if (!graphs || idx < 1 || idx > graphs.length) return '';
+            return graphs[idx - 1].url;
+          })()}
+      card_mod:
+        style: |
+          ha-card { border-radius: 12px; }
