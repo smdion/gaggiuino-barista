@@ -51,10 +51,17 @@ jobs:
       merge_ok: ${{ steps.merge.outputs.merge_ok }}
       conflict_files: ${{ steps.merge.outputs.conflict_files }}
     steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GH_PAT }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Merge upstream into branch
         id: merge
@@ -131,7 +138,7 @@ jobs:
       - name: Push branch and create PR
         if: steps.merge.outputs.merge_ok == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           UPSTREAM_SHA: ${{ needs.check-upstream.outputs.upstream_sha }}
         run: |
           BRANCH="${{ steps.merge.outputs.branch }}"
